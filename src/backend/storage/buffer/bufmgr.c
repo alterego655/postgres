@@ -3853,18 +3853,20 @@ BgBufferSync(WritebackContext *wb_context)
 			next_passes++;
 		}
 		num_to_scan--;
+        
+		if (sync_state & BUF_REUSABLE) 
+			reusable_buffers++;
 
 		if (sync_state & BUF_WRITTEN)
 		{
-			reusable_buffers++;
+			Assert(sync_state & BUF_REUSABLE);
+
 			if (++num_written >= bgwriter_lru_maxpages)
 			{
 				PendingBgWriterStats.maxwritten_clean++;
 				break;
 			}
 		}
-		else if (sync_state & BUF_REUSABLE)
-			reusable_buffers++;
 	}
 
 	PendingBgWriterStats.buf_written_clean += num_written;
