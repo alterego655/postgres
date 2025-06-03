@@ -645,6 +645,9 @@ XactLockTableDelete(TransactionId xid)
 	LockRelease(&tag, ExclusiveLock, false);
 }
 
+#define XACT_LOCK_TABLE_INITIAL_WAIT_US  1000L
+static int XactLockTableWait_us = XACT_LOCK_TABLE_INITIAL_WAIT_US;
+
 /*
  *		XactLockTableWait
  *
@@ -719,8 +722,25 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 		if (!first)
 		{
 			CHECK_FOR_INTERRUPTS();
-			pg_usleep(1000L);
+			pgstat_report_wait_start(WAIT_EVENT_XACT_DONE);
+			pg_usleep(XactLockTableWait_us);
+			pgstat_report_wait_end();
+
+			/*
+			 * For logical replication use cases (signaled by oper ==
+			 * XLTW_None), progressively increase the sleep times to avoid
+			 * busy-waiting, but not to more than 1s, since pg_usleep isn't
+			 * interruptible on some platforms. Other operations use a fixed
+			 * small delay.
+			 */
+			if (oper == XLTW_None)
+			{
+				XactLockTableWait_us *= 2;
+				if (XactLockTableWait_us > 1000000)
+					XactLockTableWait_us = 1000000;
+			}
 		}
+
 		first = false;
 		xid = SubTransGetTopmostTransaction(xid);
 	}
@@ -762,7 +782,14 @@ ConditionalXactLockTableWait(TransactionId xid, bool logLockFailure)
 		if (!first)
 		{
 			CHECK_FOR_INTERRUPTS();
-			pg_usleep(1000L);
+			/*
+			 * This function uses a fixed short sleep. It's generally not the
+			 * codepath for long waits in logical replication conflicts on a
+			 * standby, where XactLockTableWait with progressive backoff is used.
+			 */
+			pgstat_report_wait_start(WAIT_EVENT_XACT_DONE);
+			pg_usleep(1000);
+			pgstat_report_wait_end();
 		}
 		first = false;
 		xid = SubTransGetTopmostTransaction(xid);
