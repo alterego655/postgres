@@ -719,7 +719,9 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 		if (!first)
 		{
 			CHECK_FOR_INTERRUPTS();
+			pgstat_report_wait_start(WAIT_EVENT_XACT_DONE);
 			pg_usleep(1000L);
+			pgstat_report_wait_end();
 		}
 		first = false;
 		xid = SubTransGetTopmostTransaction(xid);
@@ -762,7 +764,9 @@ ConditionalXactLockTableWait(TransactionId xid, bool logLockFailure)
 		if (!first)
 		{
 			CHECK_FOR_INTERRUPTS();
+			pgstat_report_wait_start(WAIT_EVENT_XACT_DONE);
 			pg_usleep(1000L);
+			pgstat_report_wait_end();
 		}
 		first = false;
 		xid = SubTransGetTopmostTransaction(xid);
