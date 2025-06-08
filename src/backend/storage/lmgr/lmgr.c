@@ -667,6 +667,12 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 	XactLockTableWaitInfo info;
 	ErrorContextCallback callback;
 	bool		first = true;
+	long		total_sleep_us = 0;
+	long		sleep_us = 1000L;		/* Start with 1ms */
+
+	/* Progressive backoff: 1ms until 10s total, then double up to 10s max */
+	const long	BACKOFF_THRESHOLD_US = 10 * USECS_PER_SEC;
+	const long	MAX_SLEEP_US = 10 * USECS_PER_SEC;
 
 	/*
 	 * If an operation is specified, set up our verbose error context
@@ -720,8 +726,12 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 		{
 			CHECK_FOR_INTERRUPTS();
 			pgstat_report_wait_start(WAIT_EVENT_XACT_DONE);
-			pg_usleep(1000L);
+			pg_usleep(sleep_us);
 			pgstat_report_wait_end();
+
+			total_sleep_us += sleep_us;
+			if (total_sleep_us >= BACKOFF_THRESHOLD_US && sleep_us < MAX_SLEEP_US)
+				sleep_us = Min(sleep_us * 2, MAX_SLEEP_US);
 		}
 		first = false;
 		xid = SubTransGetTopmostTransaction(xid);
@@ -742,6 +752,12 @@ ConditionalXactLockTableWait(TransactionId xid, bool logLockFailure)
 {
 	LOCKTAG		tag;
 	bool		first = true;
+	long		total_sleep_us = 0;
+	long		sleep_us = 1000L;		/* Start with 1ms */
+
+	/* Progressive backoff: 1ms until 10s total, then double up to 10s max */
+	const long	BACKOFF_THRESHOLD_US = 10 * USECS_PER_SEC;
+	const long	MAX_SLEEP_US = 10 * USECS_PER_SEC;
 
 	for (;;)
 	{
@@ -765,8 +781,12 @@ ConditionalXactLockTableWait(TransactionId xid, bool logLockFailure)
 		{
 			CHECK_FOR_INTERRUPTS();
 			pgstat_report_wait_start(WAIT_EVENT_XACT_DONE);
-			pg_usleep(1000L);
+			pg_usleep(sleep_us);
 			pgstat_report_wait_end();
+
+			total_sleep_us += sleep_us;
+			if (total_sleep_us >= BACKOFF_THRESHOLD_US && sleep_us < MAX_SLEEP_US)
+				sleep_us = Min(sleep_us * 2, MAX_SLEEP_US);
 		}
 		first = false;
 		xid = SubTransGetTopmostTransaction(xid);
