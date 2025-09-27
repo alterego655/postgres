@@ -3257,7 +3257,12 @@ WaitEventIO
 WaitEventIPC
 WaitEventSet
 WaitEventTimeout
+WaitLSNProcInfo
+WaitLSNResult
+WaitLSNState
 WaitPMResult
+WaitStmt
+WaitStmtParam
 WalCloseMethod
 WalCompression
 WalInsertClass
