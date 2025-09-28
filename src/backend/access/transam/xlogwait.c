@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * xlogwait.c
- *	  Implements waiting for the given replay LSN, which is used in
- *	  WAIT FOR lsn '...'
+ *	  Implements waiting for WAL operations to reach specific LSNs.
+ *	  Used by WAIT FOR lsn '...' and internal WAL reading operations.
  *
  * Copyright (c) 2025, PostgreSQL Global Development Group
  *
@@ -10,10 +10,11 @@
  *	  src/backend/access/transam/xlogwait.c
  *
  * NOTES
- *		This file implements waiting for the replay of the given LSN on a
- *		physical standby.  The core idea is very small: every backend that
- *		wants to wait publishes the LSN it needs to the shared memory, and
- *		the startup process wakes it once that LSN has been replayed.
+ *		This file implements waiting for WAL operations to reach specific LSNs
+ *		on both physical standby and primary servers. The core idea is simple:
+ *		every process that wants to wait publishes the LSN it needs to the
+ *		shared memory, and the appropriate process (startup on standby, or
+ *		WAL writer/backend on primary) wakes it once that LSN has been reached.
  *
  *		The shared memory used by this module comprises a procInfos
  *		per-backend array with the information of the awaited LSN for each
@@ -23,14 +24,18 @@
  *
  *		In addition, the least-awaited LSN is cached as minWaitedLSN.  The
  *		waiter process publishes information about itself to the shared
- *		memory and waits on the latch before it wakens up by a startup
+ *		memory and waits on the latch before it wakens up by the appropriate
  *		process, timeout is reached, standby is promoted, or the postmaster
  *		dies.  Then, it cleans information about itself in the shared memory.
  *
- *		After replaying a WAL record, the startup process first performs a
- *		fast path check minWaitedLSN > replayLSN.  If this check is negative,
- *		it checks waitersHeap and wakes up the backend whose awaited LSNs
- *		are reached.
+ *		On standby servers: After replaying a WAL record, the startup process
+ *		first performs a fast path check minWaitedLSN > replayLSN.  If this
+ *		check is negative, it checks waitersHeap and wakes up the backend
+ *		whose awaited LSNs are reached.
+ *
+ *		On primary servers: After flushing WAL, the WAL writer or backend
+ *		process performs a similar check against the flush LSN and wakes up
+ *		waiters whose target flush LSNs have been reached.
  *
  *-------------------------------------------------------------------------
  */
@@ -81,22 +86,46 @@ WaitLSNShmemInit(void)
 														  &found);
 	if (!found)
 	{
-		pg_atomic_init_u64(&waitLSNState->minWaitedLSN, PG_UINT64_MAX);
-		pairingheap_initialize(&waitLSNState->waitersHeap, waitlsn_cmp, NULL);
+		/* Initialize replay heap and tracking */
+		pg_atomic_init_u64(&waitLSNState->minWaitedReplayLSN, PG_UINT64_MAX);
+		pairingheap_initialize(&waitLSNState->replayWaitersHeap, waitlsn_cmp, &waitLSNState->replayWaitersHeap);
+		
+		/* Initialize flush heap and tracking */
+		pg_atomic_init_u64(&waitLSNState->minWaitedFlushLSN, PG_UINT64_MAX);
+		pairingheap_initialize(&waitLSNState->flushWaitersHeap, waitlsn_cmp, &waitLSNState->flushWaitersHeap);
+		
+		/* Initialize process info array */
 		memset(&waitLSNState->procInfos, 0,
 			   (MaxBackends + NUM_AUXILIARY_PROCS) * sizeof(WaitLSNProcInfo));
 	}
 }
 
 /*
- * Comparison function for waitReplayLSN->waitersHeap heap.  Waiting processes are
- * ordered by lsn, so that the waiter with smallest lsn is at the top.
+ * Comparison function for waiters heaps. Waiting processes are
+ * ordered by LSN, so that the waiter with smallest LSN is at the top.
+ * This function works for both replay and flush heaps.
  */
 static int
 waitlsn_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	const WaitLSNProcInfo *aproc = pairingheap_const_container(WaitLSNProcInfo, phNode, a);
-	const WaitLSNProcInfo *bproc = pairingheap_const_container(WaitLSNProcInfo, phNode, b);
+	const WaitLSNProcInfo *aproc;
+	const WaitLSNProcInfo *bproc;
+	
+	/* 
+	 * We need to determine which heap node we're comparing.
+	 * Since both heap nodes are at different offsets in WaitLSNProcInfo,
+	 * we use the arg parameter to distinguish between them.
+	 */
+	if (arg == &waitLSNState->replayWaitersHeap)
+	{
+		aproc = pairingheap_const_container(WaitLSNProcInfo, replayHeapNode, a);
+		bproc = pairingheap_const_container(WaitLSNProcInfo, replayHeapNode, b);
+	}
+	else
+	{
+		aproc = pairingheap_const_container(WaitLSNProcInfo, flushHeapNode, a);
+		bproc = pairingheap_const_container(WaitLSNProcInfo, flushHeapNode, b);
+	}
 
 	if (aproc->waitLSN < bproc->waitLSN)
 		return 1;
@@ -107,65 +136,88 @@ waitlsn_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 }
 
 /*
- * Update waitReplayLSN->minWaitedLSN according to the current state of
- * waitReplayLSN->waitersHeap.
+ * Update minimum waited LSN for the specified operation type
  */
 static void
-updateMinWaitedLSN(void)
+updateMinWaitedLSN(WaitLSNOperation operation)
 {
-	XLogRecPtr	minWaitedLSN = PG_UINT64_MAX;
-
-	if (!pairingheap_is_empty(&waitLSNState->waitersHeap))
+	XLogRecPtr minWaitedLSN = PG_UINT64_MAX;
+	
+	if (operation == WAIT_LSN_REPLAY)
 	{
-		pairingheap_node *node = pairingheap_first(&waitLSNState->waitersHeap);
-
-		minWaitedLSN = pairingheap_container(WaitLSNProcInfo, phNode, node)->waitLSN;
+		if (!pairingheap_is_empty(&waitLSNState->replayWaitersHeap))
+		{
+			pairingheap_node *node = pairingheap_first(&waitLSNState->replayWaitersHeap);
+			WaitLSNProcInfo *procInfo = pairingheap_container(WaitLSNProcInfo, replayHeapNode, node);
+			minWaitedLSN = procInfo->waitLSN;
+		}
+		pg_atomic_write_u64(&waitLSNState->minWaitedReplayLSN, minWaitedLSN);
 	}
-
-	pg_atomic_write_u64(&waitLSNState->minWaitedLSN, minWaitedLSN);
+	else /* WAIT_LSN_FLUSH */
+	{
+		if (!pairingheap_is_empty(&waitLSNState->flushWaitersHeap))
+		{
+			pairingheap_node *node = pairingheap_first(&waitLSNState->flushWaitersHeap);
+			WaitLSNProcInfo *procInfo = pairingheap_container(WaitLSNProcInfo, flushHeapNode, node);
+			minWaitedLSN = procInfo->waitLSN;
+		}
+		pg_atomic_write_u64(&waitLSNState->minWaitedFlushLSN, minWaitedLSN);
+	}
 }
 
 /*
- * Put the current process into the heap of LSN waiters.
+ * Add current process to appropriate waiters heap based on operation type
  */
 static void
-addLSNWaiter(XLogRecPtr lsn)
+addLSNWaiter(XLogRecPtr lsn, WaitLSNOperation operation)
 {
 	WaitLSNProcInfo *procInfo = &waitLSNState->procInfos[MyProcNumber];
 
 	LWLockAcquire(WaitLSNLock, LW_EXCLUSIVE);
 
-	Assert(!procInfo->inHeap);
-
 	procInfo->procno = MyProcNumber;
 	procInfo->waitLSN = lsn;
 
-	pairingheap_add(&waitLSNState->waitersHeap, &procInfo->phNode);
-	procInfo->inHeap = true;
-	updateMinWaitedLSN();
+	if (operation == WAIT_LSN_REPLAY)
+	{
+		Assert(!procInfo->inReplayHeap);
+		pairingheap_add(&waitLSNState->replayWaitersHeap, &procInfo->replayHeapNode);
+		procInfo->inReplayHeap = true;
+		updateMinWaitedLSN(WAIT_LSN_REPLAY);
+	}
+	else /* WAIT_LSN_FLUSH */
+	{
+		Assert(!procInfo->inFlushHeap);
+		pairingheap_add(&waitLSNState->flushWaitersHeap, &procInfo->flushHeapNode);
+		procInfo->inFlushHeap = true;
+		updateMinWaitedLSN(WAIT_LSN_FLUSH);
+	}
 
 	LWLockRelease(WaitLSNLock);
 }
 
 /*
- * Remove the current process from the heap of LSN waiters if it's there.
+ * Remove current process from appropriate waiters heap based on operation type
  */
 static void
-deleteLSNWaiter(void)
+deleteLSNWaiter(WaitLSNOperation operation)
 {
 	WaitLSNProcInfo *procInfo = &waitLSNState->procInfos[MyProcNumber];
 
 	LWLockAcquire(WaitLSNLock, LW_EXCLUSIVE);
 
-	if (!procInfo->inHeap)
+	if (operation == WAIT_LSN_REPLAY && procInfo->inReplayHeap)
 	{
-		LWLockRelease(WaitLSNLock);
-		return;
+		pairingheap_remove(&waitLSNState->replayWaitersHeap, &procInfo->replayHeapNode);
+		procInfo->inReplayHeap = false;
+		updateMinWaitedLSN(WAIT_LSN_REPLAY);
 	}
-
-	pairingheap_remove(&waitLSNState->waitersHeap, &procInfo->phNode);
-	procInfo->inHeap = false;
-	updateMinWaitedLSN();
+	else if (operation == WAIT_LSN_FLUSH && procInfo->inFlushHeap)
+	{
+		pairingheap_remove(&waitLSNState->flushWaitersHeap, &procInfo->flushHeapNode);
+		procInfo->inFlushHeap = false;
+		updateMinWaitedLSN(WAIT_LSN_FLUSH);
+	}
 
 	LWLockRelease(WaitLSNLock);
 }
@@ -177,7 +229,7 @@ deleteLSNWaiter(void)
 #define	WAKEUP_PROC_STATIC_ARRAY_SIZE (16)
 
 /*
- * Remove waiters whose LSN has been replayed from the heap and set their
+ * Remove waiters whose LSN has been reached from the heap and set their
  * latches.  If InvalidXLogRecPtr is given, remove all waiters from the heap
  * and set latches for all waiters.
  *
@@ -188,48 +240,61 @@ deleteLSNWaiter(void)
  * if there are more waiters, this function will loop to process them in
  * multiple chunks.
  */
-void
-WaitLSNWakeup(XLogRecPtr currentLSN)
+static void
+wakeupWaiters(WaitLSNOperation operation, XLogRecPtr currentLSN)
 {
-	int			i;
-	ProcNumber	wakeUpProcs[WAKEUP_PROC_STATIC_ARRAY_SIZE];
-	int			numWakeUpProcs;
-
+	ProcNumber wakeUpProcs[WAKEUP_PROC_STATIC_ARRAY_SIZE];
+	int numWakeUpProcs;
+	int i;
+	pairingheap *heap;
+	
+	/* Select appropriate heap */
+	heap = (operation == WAIT_LSN_REPLAY) ? 
+		   &waitLSNState->replayWaitersHeap : 
+		   &waitLSNState->flushWaitersHeap;
+	
 	do
 	{
 		numWakeUpProcs = 0;
 		LWLockAcquire(WaitLSNLock, LW_EXCLUSIVE);
-
+		
 		/*
-		 * Iterate the pairing heap of waiting processes till we find LSN not
-		 * yet replayed.  Record the process numbers to wake up, but to avoid
-		 * holding the lock for too long, send the wakeups only after
-		 * releasing the lock.
+		 * Iterate the waiters heap until we find LSN not yet reached.
+		 * Record process numbers to wake up, but send wakeups after releasing lock.
 		 */
-		while (!pairingheap_is_empty(&waitLSNState->waitersHeap))
+		while (!pairingheap_is_empty(heap))
 		{
-			pairingheap_node *node = pairingheap_first(&waitLSNState->waitersHeap);
-			WaitLSNProcInfo *procInfo = pairingheap_container(WaitLSNProcInfo, phNode, node);
-
-			if (!XLogRecPtrIsInvalid(currentLSN) &&
-				procInfo->waitLSN > currentLSN)
+			pairingheap_node *node = pairingheap_first(heap);
+			WaitLSNProcInfo *procInfo;
+			
+			/* Get procInfo using appropriate heap node */
+			if (operation == WAIT_LSN_REPLAY)
+				procInfo = pairingheap_container(WaitLSNProcInfo, replayHeapNode, node);
+			else
+				procInfo = pairingheap_container(WaitLSNProcInfo, flushHeapNode, node);
+				
+			if (!XLogRecPtrIsInvalid(currentLSN) && procInfo->waitLSN > currentLSN)
 				break;
-
+				
 			Assert(numWakeUpProcs < WAKEUP_PROC_STATIC_ARRAY_SIZE);
 			wakeUpProcs[numWakeUpProcs++] = procInfo->procno;
-			(void) pairingheap_remove_first(&waitLSNState->waitersHeap);
-			procInfo->inHeap = false;
-
+			(void) pairingheap_remove_first(heap);
+			
+			/* Update appropriate flag */
+			if (operation == WAIT_LSN_REPLAY)
+				procInfo->inReplayHeap = false;
+			else
+				procInfo->inFlushHeap = false;
+				
 			if (numWakeUpProcs == WAKEUP_PROC_STATIC_ARRAY_SIZE)
 				break;
 		}
-
-		updateMinWaitedLSN();
-
+		
+		updateMinWaitedLSN(operation);
 		LWLockRelease(WaitLSNLock);
 
 		/*
-		 * Set latches for processes, whose waited LSNs are already replayed.
+		 * Set latches for processes, whose waited LSNs are already reached.
 		 * As the time consuming operations, we do this outside of
 		 * WaitLSNLock. This is  actually fine because procLatch isn't ever
 		 * freed, so we just can potentially set the wrong process' (or no
@@ -237,26 +302,55 @@ WaitLSNWakeup(XLogRecPtr currentLSN)
 		 */
 		for (i = 0; i < numWakeUpProcs; i++)
 			SetLatch(&GetPGProcByNumber(wakeUpProcs[i])->procLatch);
-
-		/* Need to recheck if there were more waiters than static array size. */
-	}
-	while (numWakeUpProcs == WAKEUP_PROC_STATIC_ARRAY_SIZE);
+			
+	} while (numWakeUpProcs == WAKEUP_PROC_STATIC_ARRAY_SIZE);
 }
 
 /*
- * Delete our item from shmem array if any.
+ * Wake up processes waiting for replay LSN to reach currentLSN
+ */
+void
+WaitLSNWakeupReplay(XLogRecPtr currentLSN)
+{
+	/* Fast path check */
+	if (pg_atomic_read_u64(&waitLSNState->minWaitedReplayLSN) > currentLSN)
+		return;
+		
+	wakeupWaiters(WAIT_LSN_REPLAY, currentLSN);
+}
+
+/*
+ * Wake up processes waiting for flush LSN to reach currentLSN
+ */
+void
+WaitLSNWakeupFlush(XLogRecPtr currentLSN)
+{
+	/* Fast path check */
+	if (pg_atomic_read_u64(&waitLSNState->minWaitedFlushLSN) > currentLSN)
+		return;
+		
+	wakeupWaiters(WAIT_LSN_FLUSH, currentLSN);
+}
+
+/*
+ * Clean up LSN waiters for exiting process
  */
 void
 WaitLSNCleanup(void)
 {
-	/*
-	 * We do a fast-path check of the 'inHeap' flag without the lock.  This
-	 * flag is set to true only by the process itself.  So, it's only possible
-	 * to get a false positive.  But that will be eliminated by a recheck
-	 * inside deleteLSNWaiter().
-	 */
-	if (waitLSNState->procInfos[MyProcNumber].inHeap)
-		deleteLSNWaiter();
+	if (waitLSNState)
+	{
+		/*
+		 * We do a fast-path check of the heap flags without the lock.  These
+		 * flags are set to true only by the process itself.  So, it's only possible
+		 * to get a false positive.  But that will be eliminated by a recheck
+		 * inside deleteLSNWaiter().
+		 */
+		if (waitLSNState->procInfos[MyProcNumber].inReplayHeap)
+			deleteLSNWaiter(WAIT_LSN_REPLAY);
+		if (waitLSNState->procInfos[MyProcNumber].inFlushHeap)
+			deleteLSNWaiter(WAIT_LSN_FLUSH);
+	}
 }
 
 /*
@@ -308,11 +402,11 @@ WaitForLSNReplay(XLogRecPtr targetLSN, int64 timeout)
 	}
 
 	/*
-	 * Add our process to the pairing heap of waiters.  It might happen that
+	 * Add our process to the replay waiters heap.  It might happen that
 	 * target LSN gets replayed before we do.  Another check at the beginning
 	 * of the loop below prevents the race condition.
 	 */
-	addLSNWaiter(targetLSN);
+	addLSNWaiter(targetLSN, WAIT_LSN_REPLAY);
 
 	for (;;)
 	{
@@ -326,7 +420,7 @@ WaitForLSNReplay(XLogRecPtr targetLSN, int64 timeout)
 			 * Recovery was ended, but recheck if target LSN was already
 			 * replayed.  See the comment regarding deleteLSNWaiter() below.
 			 */
-			deleteLSNWaiter();
+			deleteLSNWaiter(WAIT_LSN_REPLAY);
 			currentLSN = GetXLogReplayRecPtr(NULL);
 			if (PromoteIsTriggered() && targetLSN <= currentLSN)
 				return WAIT_LSN_RESULT_SUCCESS;
@@ -372,11 +466,11 @@ WaitForLSNReplay(XLogRecPtr targetLSN, int64 timeout)
 	}
 
 	/*
-	 * Delete our process from the shared memory pairing heap.  We might
-	 * already be deleted by the startup process.  The 'inHeap' flag prevents
+	 * Delete our process from the shared memory replay heap.  We might
+	 * already be deleted by the startup process.  The 'inReplayHeap' flag prevents
 	 * us from the double deletion.
 	 */
-	deleteLSNWaiter();
+	deleteLSNWaiter(WAIT_LSN_REPLAY);
 
 	/*
 	 * If we didn't reach the target LSN, we must be exited by timeout.
@@ -385,4 +479,70 @@ WaitForLSNReplay(XLogRecPtr targetLSN, int64 timeout)
 		return WAIT_LSN_RESULT_TIMEOUT;
 
 	return WAIT_LSN_RESULT_SUCCESS;
+}
+
+/*
+ * Wait for LSN to be flushed on primary server.
+ * Returns WAIT_LSN_RESULT_SUCCESS if target LSN was replayed
+ */
+void
+WaitForLSNFlush(XLogRecPtr targetLSN)
+{
+	XLogRecPtr	currentLSN;
+	int			wake_events = WL_LATCH_SET | WL_POSTMASTER_DEATH;
+
+	/* Shouldn't be called when shmem isn't initialized */
+	Assert(waitLSNState);
+
+	/* Should have a valid proc number */
+	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends + NUM_AUXILIARY_PROCS);
+
+	/* We can only wait for flush when we are not in recovery */
+	Assert(!RecoveryInProgress());
+
+	/* Quick exit if already flushed */
+	currentLSN = GetFlushRecPtr(NULL);
+	if (targetLSN <= currentLSN)
+		return;
+
+	/* Add to flush waiters */
+	addLSNWaiter(targetLSN, WAIT_LSN_FLUSH);
+
+	/* Wait loop */
+	for (;;)
+	{
+		int			rc;
+
+		/* Check if the waited LSN has been flushed */
+		currentLSN = GetFlushRecPtr(NULL);
+		if (targetLSN <= currentLSN)
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+
+		rc = WaitLatch(MyLatch, wake_events, -1,
+					   WAIT_EVENT_WAIT_FOR_WAL_FLUSH);
+
+		/*
+		 * Emergency bailout if postmaster has died. This is to avoid the
+		 * necessity for manual cleanup of all postmaster children.
+		 */
+		if (rc & WL_POSTMASTER_DEATH)
+			ereport(FATAL,
+					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					 errmsg("terminating connection due to unexpected postmaster exit"),
+					 errcontext("while waiting for LSN flush")));
+
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
+
+	/*
+	 * Delete our process from the shared memory flush heap. We might
+	 * already be deleted by the waker process. The 'inFlushHeap' flag prevents
+	 * us from the double deletion.
+	 */
+	deleteLSNWaiter(WAIT_LSN_FLUSH);
+
+	return;
 }

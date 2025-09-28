@@ -31,48 +31,66 @@ typedef enum
 } WaitLSNResult;
 
 /*
+ * Wait operation types for LSN waiting facility.
+ */
+typedef enum WaitLSNOperation
+{
+	WAIT_LSN_REPLAY,	/* Waiting for replay on standby */
+	WAIT_LSN_FLUSH		/* Waiting for flush on primary */
+} WaitLSNOperation;
+
+/*
  * WaitLSNProcInfo - the shared memory structure representing information
- * about the single process, which may wait for LSN replay.  An item of
- * waitLSN->procInfos array.
+ * about the single process, which may wait for LSN operations.  An item of
+ * waitLSNState->procInfos array.
  */
 typedef struct WaitLSNProcInfo
 {
 	/* LSN, which this process is waiting for */
 	XLogRecPtr	waitLSN;
 
-	/* Process to wake up once the waitLSN is replayed */
+	/* Process to wake up once the waitLSN is reached */
 	ProcNumber	procno;
 
-	/*
-	 * A flag indicating that this item is present in
-	 * waitReplayLSNState->waitersHeap
-	 */
-	bool		inHeap;
+	/* Type-safe heap membership flags */
+	bool		inReplayHeap;	/* In replay waiters heap */
+	bool		inFlushHeap;	/* In flush waiters heap */
 
-	/*
-	 * A pairing heap node for participation in
-	 * waitReplayLSNState->waitersHeap
-	 */
-	pairingheap_node phNode;
+	/* Separate heap nodes for type safety */
+	pairingheap_node replayHeapNode;
+	pairingheap_node flushHeapNode;
 } WaitLSNProcInfo;
 
 /*
- * WaitLSNState - the shared memory state for the replay LSN waiting facility.
+ * WaitLSNState - the shared memory state for the LSN waiting facility.
  */
 typedef struct WaitLSNState
 {
 	/*
-	 * The minimum LSN value some process is waiting for.  Used for the
+	 * The minimum replay LSN value some process is waiting for.  Used for the
 	 * fast-path checking if we need to wake up any waiters after replaying a
 	 * WAL record.  Could be read lock-less.  Update protected by WaitLSNLock.
 	 */
-	pg_atomic_uint64 minWaitedLSN;
+	pg_atomic_uint64 minWaitedReplayLSN;
 
 	/*
-	 * A pairing heap of waiting processes order by LSN values (least LSN is
+	 * A pairing heap of replay waiting processes ordered by LSN values (least LSN is
 	 * on top).  Protected by WaitLSNLock.
 	 */
-	pairingheap waitersHeap;
+	pairingheap replayWaitersHeap;
+
+	/*
+	 * The minimum flush LSN value some process is waiting for.  Used for the
+	 * fast-path checking if we need to wake up any waiters after flushing
+	 * WAL.  Could be read lock-less.  Update protected by WaitLSNLock.
+	 */
+	pg_atomic_uint64 minWaitedFlushLSN;
+
+	/*
+	 * A pairing heap of flush waiting processes ordered by LSN values (least LSN is
+	 * on top).  Protected by WaitLSNLock.
+	 */
+	pairingheap flushWaitersHeap;
 
 	/*
 	 * An array with per-process information, indexed by the process number.
@@ -86,8 +104,10 @@ extern PGDLLIMPORT WaitLSNState *waitLSNState;
 
 extern Size WaitLSNShmemSize(void);
 extern void WaitLSNShmemInit(void);
-extern void WaitLSNWakeup(XLogRecPtr currentLSN);
+extern void WaitLSNWakeupReplay(XLogRecPtr currentLSN);
+extern void WaitLSNWakeupFlush(XLogRecPtr currentLSN);
 extern void WaitLSNCleanup(void);
 extern WaitLSNResult WaitForLSNReplay(XLogRecPtr targetLSN, int64 timeout);
+extern void WaitForLSNFlush(XLogRecPtr targetLSN);
 
 #endif							/* XLOG_WAIT_H */
