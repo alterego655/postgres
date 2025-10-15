@@ -1163,10 +1163,11 @@ PortalRunUtility(Portal portal, PlannedStmt *pstmt,
 	MemoryContextSwitchTo(portal->portalContext);
 
 	/*
-	 * Some utility commands (e.g., VACUUM) pop the ActiveSnapshot stack from
-	 * under us, so don't complain if it's now empty.  Otherwise, our snapshot
-	 * should be the top one; pop it.  Note that this could be a different
-	 * snapshot from the one we made above; see EnsurePortalSnapshotExists.
+	 * Some utility commands (e.g., VACUUM, WAIT FOR) pop the ActiveSnapshot
+	 * stack from under us, so don't complain if it's now empty.  Otherwise,
+	 * our snapshot should be the top one; pop it.  Note that this could be a
+	 * different snapshot from the one we made above; see
+	 * EnsurePortalSnapshotExists.
 	 */
 	if (portal->portalSnapshot != NULL && ActiveSnapshotSet())
 	{
@@ -1743,7 +1744,8 @@ PlannedStmtRequiresSnapshot(PlannedStmt *pstmt)
 		IsA(utilityStmt, ListenStmt) ||
 		IsA(utilityStmt, NotifyStmt) ||
 		IsA(utilityStmt, UnlistenStmt) ||
-		IsA(utilityStmt, CheckPointStmt))
+		IsA(utilityStmt, CheckPointStmt) ||
+		IsA(utilityStmt, WaitStmt))
 		return false;
 
 	return true;

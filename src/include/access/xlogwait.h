@@ -27,6 +27,7 @@ typedef enum
 	WAIT_LSN_RESULT_SUCCESS,	/* Target LSN is reached */
 	WAIT_LSN_RESULT_NOT_IN_RECOVERY,	/* Recovery ended before or during our
 										 * wait */
+	WAIT_LSN_RESULT_TIMEOUT,	/* Timeout occurred */
 } WaitLSNResult;
 
 /*
@@ -106,7 +107,7 @@ extern void WaitLSNShmemInit(void);
 extern void WaitLSNWakeupReplay(XLogRecPtr currentLSN);
 extern void WaitLSNWakeupFlush(XLogRecPtr currentLSN);
 extern void WaitLSNCleanup(void);
-extern WaitLSNResult WaitForLSNReplay(XLogRecPtr targetLSN);
+extern WaitLSNResult WaitForLSNReplay(XLogRecPtr targetLSN, int64 timeout);
 extern void WaitForLSNFlush(XLogRecPtr targetLSN);
 
 #endif							/* XLOG_WAIT_H */

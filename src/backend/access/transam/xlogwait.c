@@ -364,9 +364,10 @@ WaitLSNCleanup(void)
  * or replica got promoted before the target LSN replayed.
  */
 WaitLSNResult
-WaitForLSNReplay(XLogRecPtr targetLSN)
+WaitForLSNReplay(XLogRecPtr targetLSN, int64 timeout)
 {
 	XLogRecPtr	currentLSN;
+	TimestampTz	endtime = 0;
 	int			wake_events = WL_LATCH_SET | WL_POSTMASTER_DEATH;
 
 	/* Shouldn't be called when shmem isn't initialized */
@@ -374,6 +375,11 @@ WaitForLSNReplay(XLogRecPtr targetLSN)
 
 	/* Should have a valid proc number */
 	Assert(MyProcNumber >= 0 && MyProcNumber < MaxBackends);
+
+	if (timeout > 0) {
+		endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout);
+		wake_events |= WL_TIMEOUT;
+	}
 
 	/*
 	 * Add our process to the replay waiters heap.  It might happen that
@@ -385,6 +391,7 @@ WaitForLSNReplay(XLogRecPtr targetLSN)
 	for (;;)
 	{
 		int			rc;
+		long		delay_ms = 0;
 		currentLSN = GetXLogReplayRecPtr(NULL);
 
 		/* Recheck that recovery is still in-progress */
@@ -407,9 +414,16 @@ WaitForLSNReplay(XLogRecPtr targetLSN)
 				break;
 		}
 
+		if (timeout > 0)
+		{
+			delay_ms = TimestampDifferenceMilliseconds(GetCurrentTimestamp(), endtime);
+			if (delay_ms <= 0)
+				break;
+		}
+
 		CHECK_FOR_INTERRUPTS();
 
-		rc = WaitLatch(MyLatch, wake_events, -1,
+		rc = WaitLatch(MyLatch, wake_events, delay_ms,
 					   WAIT_EVENT_WAIT_FOR_WAL_REPLAY);
 
 		/*
@@ -432,6 +446,12 @@ WaitForLSNReplay(XLogRecPtr targetLSN)
 	 * us from the double deletion.
 	 */
 	deleteLSNWaiter(WAIT_LSN_REPLAY);
+
+	/*
+	 * If we didn't reach the target LSN, we must be exited by timeout.
+	 */
+	if (targetLSN > currentLSN)
+		return WAIT_LSN_RESULT_TIMEOUT;
 
 	return WAIT_LSN_RESULT_SUCCESS;
 }
