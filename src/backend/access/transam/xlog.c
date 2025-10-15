@@ -62,6 +62,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "access/xlogwait.h"
 #include "backup/basebackup.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
@@ -2913,6 +2914,15 @@ XLogFlush(XLogRecPtr record)
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());
 
 	/*
+	 * If we flushed an LSN that someone was waiting for then walk
+	 * over the shared memory array and set latches to notify the
+	 * waiters.
+	 */
+	if (waitLSNState &&
+		(LogwrtResult.Flush >= pg_atomic_read_u64(&waitLSNState->minWaitedFlushLSN)))
+		WaitLSNWakeupFlush(LogwrtResult.Flush);
+
+	/*
 	 * If we still haven't flushed to the request point then we have a
 	 * problem; most likely, the requested flush point is past end of XLOG.
 	 * This has been seen to occur when a disk page has a corrupted LSN.
@@ -3093,6 +3103,15 @@ XLogBackgroundFlush(void)
 
 	/* wake up walsenders now that we've released heavily contended locks */
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());
+
+	/*
+	 * If we flushed an LSN that someone was waiting for then walk
+	 * over the shared memory array and set latches to notify the
+	 * waiters.
+	 */
+	if (waitLSNState &&
+		(LogwrtResult.Flush >= pg_atomic_read_u64(&waitLSNState->minWaitedFlushLSN)))
+		WaitLSNWakeupFlush(LogwrtResult.Flush);
 
 	/*
 	 * Great, done. To take some work off the critical path, try to initialize
@@ -6224,6 +6243,12 @@ StartupXLOG(void)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+
+	/*
+	 * Wake up all waiters for replay LSN.  They need to report an error that
+	 * recovery was ended before reaching the target LSN.
+	 */
+	WaitLSNWakeupReplay(InvalidXLogRecPtr);
 
 	/*
 	 * Shutdown the recovery environment.  This must occur after
