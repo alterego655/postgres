@@ -863,38 +863,25 @@ static void
 SnapBuildPurgeOlderTxn(SnapBuild *builder)
 {
 	int			off;
-	TransactionId *workspace;
-	int			surviving_xids = 0;
+	int			write_idx = 0;
+	int			surviving_xids;
 
 	/* not ready yet */
 	if (!TransactionIdIsNormal(builder->xmin))
 		return;
 
-	/* TODO: Neater algorithm than just copying and iterating? */
-	workspace =
-		MemoryContextAlloc(builder->context,
-						   builder->committed.xcnt * sizeof(TransactionId));
-
-	/* copy xids that still are interesting to workspace */
+	/* Use in-place compaction to remove xids < xmin */
 	for (off = 0; off < builder->committed.xcnt; off++)
 	{
-		if (NormalTransactionIdPrecedes(builder->committed.xip[off],
-										builder->xmin))
-			;					/* remove */
-		else
-			workspace[surviving_xids++] = builder->committed.xip[off];
+		if (!NormalTransactionIdPrecedes(builder->committed.xip[off],
+										 builder->xmin))
+			builder->committed.xip[write_idx++] = builder->committed.xip[off];
 	}
 
-	/* copy workspace back to persistent state */
-	memcpy(builder->committed.xip, workspace,
-		   surviving_xids * sizeof(TransactionId));
-
 	elog(DEBUG3, "purged committed transactions from %u to %u, xmin: %u, xmax: %u",
-		 (uint32) builder->committed.xcnt, (uint32) surviving_xids,
+		 (uint32) builder->committed.xcnt, (uint32) write_idx,
 		 builder->xmin, builder->xmax);
-	builder->committed.xcnt = surviving_xids;
-
-	pfree(workspace);
+	builder->committed.xcnt = write_idx;
 
 	/*
 	 * Purge xids in ->catchange as well. The purged array must also be sorted
