@@ -348,6 +348,26 @@ pg_last_wal_receive_lsn(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Report the last WAL write location (same format as pg_backup_start etc)
+ *
+ * This is useful for determining how much of WAL has been received and
+ * passed to the operating system by walreceiver.  Unlike pg_last_wal_receive_lsn,
+ * this data may still be in OS buffers and not yet synced to durable storage.
+ */
+Datum
+pg_last_wal_write_lsn(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	recptr;
+
+	recptr = GetWalRcvWriteRecPtr();
+
+	if (!XLogRecPtrIsValid(recptr))
+		PG_RETURN_NULL();
+
+	PG_RETURN_LSN(recptr);
+}
+
+/*
  * Report the last WAL replay location (same format as pg_backup_start etc)
  *
  * This is useful for determining how much of WAL is visible to read-only

@@ -691,6 +691,28 @@ postgres=# SELECT '0/0'::pg_lsn + pd.segment_number * ps.setting::int + :offset 
       <row>
        <entry role="func_table_entry"><para role="func_signature">
         <indexterm>
+         <primary>pg_last_wal_write_lsn</primary>
+        </indexterm>
+        <function>pg_last_wal_write_lsn</function> ()
+        <returnvalue>pg_lsn</returnvalue>
+       </para>
+       <para>
+        Returns the last write-ahead log location that has been received and
+        passed to the operating system by streaming replication, but not
+        necessarily synced to durable storage.  This is faster than
+        <function>pg_last_wal_receive_lsn</function> but provides weaker
+        durability guarantees since the data may still be in OS buffers.
+        While streaming replication is in progress this will increase
+        monotonically. If recovery has completed then this will remain static
+        at the location of the last WAL record written during recovery. If
+        streaming replication is disabled, or if it has not yet started, the
+        function returns <literal>NULL</literal>.
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
          <primary>pg_last_wal_replay_lsn</primary>
         </indexterm>
         <function>pg_last_wal_replay_lsn</function> ()
