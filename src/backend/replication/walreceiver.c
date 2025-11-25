@@ -57,6 +57,7 @@
 #include "access/xlog_internal.h"
 #include "access/xlogarchive.h"
 #include "access/xlogrecovery.h"
+#include "access/xlogwait.h"
 #include "catalog/pg_authid.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
@@ -966,6 +967,15 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 	pg_atomic_write_u64(&WalRcv->writtenUpto, LogstreamResult.Write);
 
 	/*
+	 * If we wrote an LSN that someone was waiting for then walk over the
+	 * shared memory array and set latches to notify the waiters.
+	 */
+	if (waitLSNState &&
+		(LogstreamResult.Write >=
+		 pg_atomic_read_u64(&waitLSNState->minWaitedLSN[WAIT_LSN_TYPE_WRITE_STANDBY])))
+		WaitLSNWakeup(WAIT_LSN_TYPE_WRITE_STANDBY, LogstreamResult.Write);
+
+	/*
 	 * Close the current segment if it's fully written up in the last cycle of
 	 * the loop, to create its archive notification file soon. Otherwise WAL
 	 * archiving of the segment will be delayed until any data in the next
@@ -1003,6 +1013,15 @@ XLogWalRcvFlush(bool dying, TimeLineID tli)
 			walrcv->receivedTLI = tli;
 		}
 		SpinLockRelease(&walrcv->mutex);
+
+		/*
+		 * If we flushed an LSN that someone was waiting for then walk over
+		 * the shared memory array and set latches to notify the waiters.
+		 */
+		if (waitLSNState &&
+			(LogstreamResult.Flush >=
+			 pg_atomic_read_u64(&waitLSNState->minWaitedLSN[WAIT_LSN_TYPE_FLUSH_STANDBY])))
+			WaitLSNWakeup(WAIT_LSN_TYPE_FLUSH_STANDBY, LogstreamResult.Flush);
 
 		/* Signal the startup process and walsender that new WAL has arrived */
 		WakeupRecovery();

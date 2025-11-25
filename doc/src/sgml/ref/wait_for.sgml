@@ -16,12 +16,13 @@ PostgreSQL documentation
 
  <refnamediv>
   <refname>WAIT FOR</refname>
-  <refpurpose>wait for target <acronym>LSN</acronym> to be replayed, optionally with a timeout</refpurpose>
+  <refpurpose>wait for WAL to reach a target <acronym>LSN</acronym> on a replica</refpurpose>
  </refnamediv>
 
  <refsynopsisdiv>
 <synopsis>
-WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>' [ WITH ( <replaceable class="parameter">option</replaceable> [, ...] ) ]
+WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>' [ MODE { REPLAY | FLUSH | WRITE } ]
+    [ WITH ( <replaceable class="parameter">option</replaceable> [, ...] ) ]
 
 <phrase>where <replaceable class="parameter">option</replaceable> can be:</phrase>
 
@@ -34,20 +35,22 @@ WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>' [ WITH ( <replac
   <title>Description</title>
 
   <para>
-    Waits until recovery replays <parameter>lsn</parameter>.
-    If no <parameter>timeout</parameter> is specified or it is set to
-    zero, this command waits indefinitely for the
-    <parameter>lsn</parameter>.
-    On timeout, or if the server is promoted before
-    <parameter>lsn</parameter> is reached, an error is emitted,
-    unless <literal>NO_THROW</literal> is specified in the WITH clause.
-    If <parameter>NO_THROW</parameter> is specified, then the command
-    doesn't throw errors.
+   Waits until the specified <parameter>lsn</parameter> is reached
+   according to the specified <parameter>mode</parameter>,
+   which determines whether to wait for WAL to be written, flushed, or replayed.
+   If no <parameter>timeout</parameter> is specified or it is set to
+   zero, this command waits indefinitely for the
+   <parameter>lsn</parameter>.
+   On timeout, or if the server is promoted before
+   <parameter>lsn</parameter> is reached, an error is emitted,
+   unless <literal>NO_THROW</literal> is specified in the WITH clause.
+   If <parameter>NO_THROW</parameter> is specified, then the command
+   doesn't throw errors.
   </para>
 
   <para>
-    The possible return values are <literal>success</literal>,
-    <literal>timeout</literal>, and <literal>not in recovery</literal>.
+   The possible return values are <literal>success</literal>,
+   <literal>timeout</literal>, and <literal>not in recovery</literal>.
   </para>
  </refsect1>
 
@@ -61,6 +64,57 @@ WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>' [ WITH ( <replac
      <para>
       Specifies the target <acronym>LSN</acronym> to wait for.
      </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>MODE</literal></term>
+    <listitem>
+     <para>
+      Specifies the type of LSN processing to wait for. If not specified,
+      the default is <literal>REPLAY</literal>. The valid modes are:
+     </para>
+
+     <variablelist>
+      <varlistentry>
+       <term><literal>REPLAY</literal></term>
+       <listitem>
+        <para>
+         Wait for the LSN to be replayed (applied to the database).
+         After successful completion, <function>pg_last_wal_replay_lsn()</function>
+         will return a value greater than or equal to the target LSN.
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry>
+       <term><literal>FLUSH</literal></term>
+       <listitem>
+        <para>
+         Wait for the WAL containing the LSN to be received from the
+         primary and synced to durable storage via <function>fsync()</function>.
+         This provides a durability guarantee without waiting for the WAL
+         to be applied. After successful completion,
+         <function>pg_last_wal_receive_lsn()</function> will return a value
+         greater than or equal to the target LSN.
+        </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry>
+       <term><literal>WRITE</literal></term>
+       <listitem>
+        <para>
+         Wait for the WAL containing the LSN to be received from the
+         primary and passed to the operating system via <function>write()</function>.
+         This is faster than <literal>FLUSH</literal> but provides weaker
+         durability guarantees since the data may still be in OS buffers.
+         After successful completion, <function>pg_last_wal_write_lsn()</function>
+         will return a value greater than or equal to the target LSN.
+        </para>
+       </listitem>
+      </varlistentry>
+     </variablelist>
     </listitem>
    </varlistentry>
 
@@ -135,9 +189,12 @@ WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>' [ WITH ( <replac
     <listitem>
      <para>
       This return value denotes that the database server is not in a recovery
-      state.  This might mean either the database server was not in recovery
-      at the moment of receiving the command, or it was promoted before
-      reaching the target <parameter>lsn</parameter>.
+      state. This might mean either the database server was not in recovery
+      at the moment of receiving the command (i.e., executed on a primary),
+      or it was promoted before reaching the target <parameter>lsn</parameter>.
+      In the promotion case, this status indicates a timeline change occurred,
+      and the application should re-evaluate whether the target LSN is still
+      relevant.
      </para>
     </listitem>
    </varlistentry>
@@ -148,25 +205,33 @@ WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>' [ WITH ( <replac
   <title>Notes</title>
 
   <para>
-    <command>WAIT FOR</command> command waits till
-    <parameter>lsn</parameter> to be replayed on standby.
-    That is, after this command execution, the value returned by
-    <function>pg_last_wal_replay_lsn</function> should be greater or equal
-    to the <parameter>lsn</parameter> value.  This is useful to achieve
-    read-your-writes-consistency, while using async replica for reads and
-    primary for writes.  In that case, the <acronym>lsn</acronym> of the last
-    modification should be stored on the client application side or the
-    connection pooler side.
+   <command>WAIT FOR</command> waits until the specified
+   <parameter>lsn</parameter> is reached according to the specified
+   <parameter>mode</parameter>. The <literal>REPLAY</literal> mode waits
+   for the LSN to be replayed (applied to the database), which is useful
+   to achieve read-your-writes consistency while using an async replica
+   for reads and the primary for writes. The <literal>FLUSH</literal> mode
+   waits for the WAL to be flushed to durable storage on the replica,
+   providing a durability guarantee without waiting for replay. The
+   <literal>WRITE</literal> mode waits for the WAL to be written to the
+   operating system, which is faster than flush but provides weaker
+   durability guarantees. In all cases, the <acronym>LSN</acronym> of the
+   last modification should be stored on the client application side or
+   the connection pooler side.
   </para>
 
   <para>
-    <command>WAIT FOR</command> command should be called on standby.
-    If a user runs <command>WAIT FOR</command> on primary, it
-    will error out unless <parameter>NO_THROW</parameter> is specified in the WITH clause.
-    However, if <command>WAIT FOR</command> is
-    called on primary promoted from standby and <literal>lsn</literal>
-    was already replayed, then the <command>WAIT FOR</command> command just
-    exits immediately.
+   <command>WAIT FOR</command> should be called on a standby.
+   If a user runs <command>WAIT FOR</command> on the primary, it
+   will error out unless <parameter>NO_THROW</parameter> is specified
+   in the WITH clause. However, if <command>WAIT FOR</command> is
+   called on a primary promoted from standby and <literal>lsn</literal>
+   was already reached, then the <command>WAIT FOR</command> command
+   just exits immediately. If the replica is promoted while waiting,
+   the command will return <literal>not in recovery</literal> (or throw
+   an error if <literal>NO_THROW</literal> is not specified). Promotion
+   creates a new timeline, and the LSN being waited for may refer to
+   WAL from the old timeline.
   </para>
 
 </refsect1>
@@ -175,21 +240,21 @@ WAIT FOR LSN '<replaceable class="parameter">lsn</replaceable>' [ WITH ( <replac
   <title>Examples</title>
 
   <para>
-    You can use <command>WAIT FOR</command> command to wait for
-    the <type>pg_lsn</type> value.  For example, an application could update
-    the <literal>movie</literal> table and get the <acronym>lsn</acronym> after
-    changes just made.  This example uses <function>pg_current_wal_insert_lsn</function>
-    on primary server to get the <acronym>lsn</acronym> given that
-    <varname>synchronous_commit</varname> could be set to
-    <literal>off</literal>.
+   You can use <command>WAIT FOR</command> command to wait for
+   the <type>pg_lsn</type> value.  For example, an application could update
+   the <literal>movie</literal> table and get the <acronym>lsn</acronym> after
+   changes just made.  This example uses <function>pg_current_wal_insert_lsn</function>
+   on primary server to get the <acronym>lsn</acronym> given that
+   <varname>synchronous_commit</varname> could be set to
+   <literal>off</literal>.
 
    <programlisting>
 postgres=# UPDATE movie SET genre = 'Dramatic' WHERE genre = 'Drama';
 UPDATE 100
 postgres=# SELECT pg_current_wal_insert_lsn();
-pg_current_wal_insert_lsn
---------------------
-0/306EE20
+ pg_current_wal_insert_lsn
+---------------------------
+ 0/306EE20
 (1 row)
 </programlisting>
 
@@ -198,9 +263,9 @@ pg_current_wal_insert_lsn
    changes made on primary should be guaranteed to be visible on replica.
 
 <programlisting>
-postgres=# WAIT FOR LSN '0/306EE20';
+postgres=# WAIT FOR LSN '0/306EE20' MODE REPLAY;
  status
---------
+---------
  success
 (1 row)
 postgres=# SELECT * FROM movie WHERE genre = 'Drama';
@@ -211,21 +276,46 @@ postgres=# SELECT * FROM movie WHERE genre = 'Drama';
   </para>
 
   <para>
-    If the target LSN is not reached before the timeout, the error is thrown.
+   Wait for flush (data durable on replica):
 
 <programlisting>
-postgres=# WAIT FOR LSN '0/306EE20' WITH (TIMEOUT '0.1s');
+postgres=# WAIT FOR LSN '0/306EE20' MODE FLUSH;
+ status
+---------
+ success
+(1 row)
+</programlisting>
+  </para>
+
+  <para>
+   Wait for write with timeout:
+
+<programlisting>
+postgres=# WAIT FOR LSN '0/306EE20' MODE WRITE WITH (TIMEOUT '100ms', NO_THROW);
+ status
+---------
+ success
+(1 row)
+</programlisting>
+  </para>
+
+  <para>
+   If the target LSN is not reached before the timeout, an error is thrown:
+
+<programlisting>
+postgres=# WAIT FOR LSN '0/306EE20' MODE REPLAY WITH (TIMEOUT '0.1s');
 ERROR:  timed out while waiting for target LSN 0/306EE20 to be replayed; current replay LSN 0/306EA60
 </programlisting>
   </para>
 
   <para>
    The same example uses <command>WAIT FOR</command> with
-   <parameter>NO_THROW</parameter> option.
+   <parameter>NO_THROW</parameter> option:
+
 <programlisting>
-postgres=# WAIT FOR LSN '0/306EE20' WITH (TIMEOUT '100ms', NO_THROW);
+postgres=# WAIT FOR LSN '0/306EE20' MODE REPLAY WITH (TIMEOUT '100ms', NO_THROW);
  status
---------
+---------
  timeout
 (1 row)
 </programlisting>
