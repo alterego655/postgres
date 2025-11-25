@@ -35,9 +35,15 @@ typedef enum
  */
 typedef enum WaitLSNType
 {
-	WAIT_LSN_TYPE_REPLAY = 0,	/* Waiting for replay on standby */
-	WAIT_LSN_TYPE_FLUSH = 1,	/* Waiting for flush on primary */
-	WAIT_LSN_TYPE_COUNT = 2
+	/* Standby wait types (walreceiver/startup wakes) */
+	WAIT_LSN_TYPE_REPLAY_STANDBY = 0,
+	WAIT_LSN_TYPE_WRITE_STANDBY = 1,
+	WAIT_LSN_TYPE_FLUSH_STANDBY = 2,
+
+	/* Primary wait types (WAL writer/backends wake) */
+	WAIT_LSN_TYPE_FLUSH_PRIMARY = 3,
+
+	WAIT_LSN_TYPE_COUNT = 4
 } WaitLSNType;
 
 /*
@@ -96,6 +102,7 @@ extern PGDLLIMPORT WaitLSNState *waitLSNState;
 
 extern Size WaitLSNShmemSize(void);
 extern void WaitLSNShmemInit(void);
+extern XLogRecPtr GetCurrentLSNForWaitType(WaitLSNType lsnType);
 extern void WaitLSNWakeup(WaitLSNType lsnType, XLogRecPtr currentLSN);
 extern void WaitLSNCleanup(void);
 extern WaitLSNResult WaitForLSN(WaitLSNType lsnType, XLogRecPtr targetLSN,
