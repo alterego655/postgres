@@ -130,6 +130,7 @@ typedef enum WalRcvWakeupReason
 static TimestampTz wakeup[NUM_WALRCV_WAKEUPS];
 
 static StringInfoData reply_message;
+static XLogRecPtr initialApplyPtr = InvalidXLogRecPtr;
 
 /* Prototypes for private functions */
 static void WalRcvFetchTimeLineHistoryFiles(TimeLineID first, TimeLineID last);
@@ -204,6 +205,8 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 			/* The usual case */
 			break;
 
+		case WALRCV_CONNECTING:
+		case WALRCV_CONNECTED:
 		case WALRCV_WAITING:
 		case WALRCV_STREAMING:
 		case WALRCV_RESTARTING:
@@ -214,7 +217,7 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 	}
 	/* Advertise our PID so that the startup process can kill us */
 	walrcv->pid = MyProcPid;
-	walrcv->walRcvState = WALRCV_STREAMING;
+	walrcv->walRcvState = WALRCV_CONNECTING;
 
 	/* Fetch information required to start streaming */
 	walrcv->ready_to_display = false;
@@ -397,6 +400,13 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 			/* Initialize LogstreamResult and buffers for processing messages */
 			LogstreamResult.Write = LogstreamResult.Flush = GetXLogReplayRecPtr(NULL);
 			initStringInfo(&reply_message);
+
+			/* We are connected, but have not yet applied WAL from this stream */
+			initialApplyPtr = LogstreamResult.Write;
+			SpinLockAcquire(&walrcv->mutex);
+			if (walrcv->walRcvState == WALRCV_CONNECTING)
+				walrcv->walRcvState = WALRCV_CONNECTED;
+			SpinLockRelease(&walrcv->mutex);
 
 			/* Initialize nap wakeup times. */
 			now = GetCurrentTimestamp();
@@ -688,8 +698,9 @@ WalRcvWaitForStartPosition(XLogRecPtr *startpoint, TimeLineID *startpointTLI)
 			 */
 			*startpoint = walrcv->receiveStart;
 			*startpointTLI = walrcv->receiveStartTLI;
-			walrcv->walRcvState = WALRCV_STREAMING;
+			walrcv->walRcvState = WALRCV_CONNECTING;
 			SpinLockRelease(&walrcv->mutex);
+			initialApplyPtr = InvalidXLogRecPtr;
 			break;
 		}
 		if (walrcv->walRcvState == WALRCV_STOPPING)
@@ -790,7 +801,9 @@ WalRcvDie(int code, Datum arg)
 
 	/* Mark ourselves inactive in shared memory */
 	SpinLockAcquire(&walrcv->mutex);
-	Assert(walrcv->walRcvState == WALRCV_STREAMING ||
+	Assert(walrcv->walRcvState == WALRCV_CONNECTING ||
+		   walrcv->walRcvState == WALRCV_CONNECTED ||
+		   walrcv->walRcvState == WALRCV_STREAMING ||
 		   walrcv->walRcvState == WALRCV_RESTARTING ||
 		   walrcv->walRcvState == WALRCV_STARTING ||
 		   walrcv->walRcvState == WALRCV_WAITING ||
@@ -989,6 +1002,7 @@ XLogWalRcvFlush(bool dying, TimeLineID tli)
 	if (LogstreamResult.Flush < LogstreamResult.Write)
 	{
 		WalRcvData *walrcv = WalRcv;
+		bool		force_reply = false;
 
 		issue_xlog_fsync(recvFile, recvSegNo, tli);
 
@@ -1001,6 +1015,8 @@ XLogWalRcvFlush(bool dying, TimeLineID tli)
 			walrcv->latestChunkStart = walrcv->flushedUpto;
 			walrcv->flushedUpto = LogstreamResult.Flush;
 			walrcv->receivedTLI = tli;
+			if (walrcv->walRcvState == WALRCV_CONNECTED)
+				force_reply = true;
 		}
 		SpinLockRelease(&walrcv->mutex);
 
@@ -1022,7 +1038,7 @@ XLogWalRcvFlush(bool dying, TimeLineID tli)
 		/* Also let the primary know that we made some progress */
 		if (!dying)
 		{
-			XLogWalRcvSendReply(false, false);
+			XLogWalRcvSendReply(force_reply, false);
 			XLogWalRcvSendHSFeedback(false);
 		}
 	}
@@ -1128,6 +1144,21 @@ XLogWalRcvSendReply(bool force, bool requestReply)
 	writePtr = LogstreamResult.Write;
 	flushPtr = LogstreamResult.Flush;
 	applyPtr = GetXLogReplayRecPtr(NULL);
+
+	/*
+	 * If we've established the replication connection but have not yet proven
+	 * WAL is flowing end-to-end, flip to STREAMING once applyPtr advances
+	 * beyond the baseline captured when START_REPLICATION succeeded.
+	 */
+	if (WalRcv->walRcvState == WALRCV_CONNECTED &&
+		XLogRecPtrIsValid(initialApplyPtr) &&
+		applyPtr != initialApplyPtr)
+	{
+		SpinLockAcquire(&WalRcv->mutex);
+		if (WalRcv->walRcvState == WALRCV_CONNECTED)
+			WalRcv->walRcvState = WALRCV_STREAMING;
+		SpinLockRelease(&WalRcv->mutex);
+	}
 
 	resetStringInfo(&reply_message);
 	pq_sendbyte(&reply_message, PqReplMsg_StandbyStatusUpdate);
@@ -1373,6 +1404,10 @@ WalRcvGetStateString(WalRcvState state)
 			return "stopped";
 		case WALRCV_STARTING:
 			return "starting";
+		case WALRCV_CONNECTING:
+			return "connecting";
+		case WALRCV_CONNECTED:
+			return "connected";
 		case WALRCV_STREAMING:
 			return "streaming";
 		case WALRCV_WAITING:
