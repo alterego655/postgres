@@ -2,7 +2,7 @@
  *
  * wait.c
  *	  Implements WAIT FOR, which allows waiting for events such as
- *	  time passing or LSN having been replayed on replica.
+ *	  time passing or LSN having been replayed, flushed, or written.
  *
  * Portions Copyright (c) 2025, PostgreSQL Global Development Group
  *
@@ -15,6 +15,7 @@
 
 #include <math.h>
 
+#include "access/xlog.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogwait.h"
 #include "commands/defrem.h"
@@ -28,12 +29,28 @@
 #include "utils/snapmgr.h"
 
 
+/*
+ * Type descriptor for WAIT FOR LSN wait types, used for error messages.
+ */
+typedef struct WaitLSNTypeDesc
+{
+	const char *noun;			/* "replay", "flush", "write" */
+	const char *verb;			/* "replayed", "flushed", "written" */
+}			WaitLSNTypeDesc;
+
+static const WaitLSNTypeDesc WaitLSNTypeDescs[] = {
+	[WAIT_LSN_TYPE_STANDBY_REPLAY] = {"replay", "replayed"},
+	[WAIT_LSN_TYPE_STANDBY_WRITE] = {"write", "written"},
+	[WAIT_LSN_TYPE_STANDBY_FLUSH] = {"flush", "flushed"},
+};
+
 void
 ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, DestReceiver *dest)
 {
 	XLogRecPtr	lsn;
 	int64		timeout = 0;
 	WaitLSNResult waitLSNResult;
+	WaitLSNType lsnType;
 	bool		throw = true;
 	TupleDesc	tupdesc;
 	TupOutputState *tstate;
@@ -44,6 +61,22 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, DestReceiver *dest)
 	/* Parse and validate the mandatory LSN */
 	lsn = DatumGetLSN(DirectFunctionCall1(pg_lsn_in,
 										  CStringGetDatum(stmt->lsn_literal)));
+
+	/* Convert parse-time WaitLSNMode to runtime WaitLSNType */
+	switch (stmt->mode)
+	{
+		case WAIT_LSN_MODE_REPLAY:
+			lsnType = WAIT_LSN_TYPE_STANDBY_REPLAY;
+			break;
+		case WAIT_LSN_MODE_WRITE:
+			lsnType = WAIT_LSN_TYPE_STANDBY_WRITE;
+			break;
+		case WAIT_LSN_MODE_FLUSH:
+			lsnType = WAIT_LSN_TYPE_STANDBY_FLUSH;
+			break;
+		default:
+			elog(ERROR, "unrecognized wait mode: %d", stmt->mode);
+	}
 
 	foreach_node(DefElem, defel, stmt->options)
 	{
@@ -107,8 +140,8 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, DestReceiver *dest)
 	}
 
 	/*
-	 * We are going to wait for the LSN replay.  We should first care that we
-	 * don't hold a snapshot and correspondingly our MyProc->xmin is invalid.
+	 * We are going to wait for the LSN.  We should first care that we don't
+	 * hold a snapshot and correspondingly our MyProc->xmin is invalid.
 	 * Otherwise, our snapshot could prevent the replay of WAL records
 	 * implying a kind of self-deadlock.  This is the reason why WAIT FOR is a
 	 * command, not a procedure or function.
@@ -140,7 +173,7 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, DestReceiver *dest)
 	 */
 	Assert(MyProc->xmin == InvalidTransactionId);
 
-	waitLSNResult = WaitForLSN(WAIT_LSN_TYPE_STANDBY_REPLAY, lsn, timeout);
+	waitLSNResult = WaitForLSN(lsnType, lsn, timeout);
 
 	/*
 	 * Process the result of WaitForLSN().  Throw appropriate error if needed.
@@ -154,11 +187,18 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, DestReceiver *dest)
 
 		case WAIT_LSN_RESULT_TIMEOUT:
 			if (throw)
+			{
+				const		WaitLSNTypeDesc *desc = &WaitLSNTypeDescs[lsnType];
+				XLogRecPtr	currentLSN = GetCurrentLSNForWaitType(lsnType);
+
 				ereport(ERROR,
 						errcode(ERRCODE_QUERY_CANCELED),
-						errmsg("timed out while waiting for target LSN %X/%08X to be replayed; current replay LSN %X/%08X",
+						errmsg("timed out while waiting for target LSN %X/%08X to be %s; current %s LSN %X/%08X",
 							   LSN_FORMAT_ARGS(lsn),
-							   LSN_FORMAT_ARGS(GetXLogReplayRecPtr(NULL))));
+							   desc->verb,
+							   desc->noun,
+							   LSN_FORMAT_ARGS(currentLSN)));
+			}
 			else
 				result = "timeout";
 			break;
@@ -166,20 +206,26 @@ ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, DestReceiver *dest)
 		case WAIT_LSN_RESULT_NOT_IN_RECOVERY:
 			if (throw)
 			{
+				const		WaitLSNTypeDesc *desc = &WaitLSNTypeDescs[lsnType];
+				XLogRecPtr	currentLSN = GetCurrentLSNForWaitType(lsnType);
+
 				if (PromoteIsTriggered())
 				{
 					ereport(ERROR,
 							errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("recovery is not in progress"),
-							errdetail("Recovery ended before replaying target LSN %X/%08X; last replay LSN %X/%08X.",
+							errdetail("Recovery ended before target LSN %X/%08X was %s; last %s LSN %X/%08X.",
 									  LSN_FORMAT_ARGS(lsn),
-									  LSN_FORMAT_ARGS(GetXLogReplayRecPtr(NULL))));
+									  desc->verb,
+									  desc->noun,
+									  LSN_FORMAT_ARGS(currentLSN)));
 				}
 				else
 					ereport(ERROR,
 							errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("recovery is not in progress"),
-							errhint("Waiting for the replay LSN can only be executed during recovery."));
+							errhint("Waiting for the %s LSN can only be executed during recovery.",
+									desc->noun));
 			}
 			else
 				result = "not in recovery";

@@ -1,4 +1,4 @@
-# Checks waiting for the LSN replay on standby using
+# Checks waiting for the LSN replay/write/flush on standby using
 # the WAIT FOR command.
 use strict;
 use warnings FATAL => 'all';
@@ -6,6 +6,38 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+
+# Helper functions to control walreceiver for testing wait conditions.
+# These allow us to stop WAL streaming so waiters block, then resume it.
+my $saved_primary_conninfo;
+
+sub stop_walreceiver
+{
+	my ($node) = @_;
+	$saved_primary_conninfo = $node->safe_psql('postgres',
+		"SELECT setting FROM pg_settings WHERE name = 'primary_conninfo'");
+	$node->safe_psql(
+		'postgres', qq[
+		ALTER SYSTEM SET primary_conninfo = '';
+		SELECT pg_reload_conf();
+	]);
+
+	$node->poll_query_until('postgres',
+		"SELECT NOT EXISTS (SELECT * FROM pg_stat_wal_receiver);");
+}
+
+sub resume_walreceiver
+{
+	my ($node) = @_;
+	$node->safe_psql(
+		'postgres', qq[
+		ALTER SYSTEM SET primary_conninfo = '$saved_primary_conninfo';
+		SELECT pg_reload_conf();
+	]);
+
+	$node->poll_query_until('postgres',
+		"SELECT EXISTS (SELECT * FROM pg_stat_wal_receiver);");
+}
 
 # Initialize primary node
 my $node_primary = PostgreSQL::Test::Cluster->new('primary');
@@ -62,7 +94,34 @@ $output = $node_standby->safe_psql(
 ok((split("\n", $output))[-1] eq 30,
 	"standby reached the same LSN as primary");
 
-# 3. Check that waiting for unreachable LSN triggers the timeout.  The
+# 3. Check that WAIT FOR works with WRITE and FLUSH modes.
+$node_primary->safe_psql('postgres',
+	"INSERT INTO wait_test VALUES (generate_series(31, 40))");
+my $lsn_write =
+  $node_primary->safe_psql('postgres', "SELECT pg_current_wal_insert_lsn()");
+$output = $node_standby->safe_psql(
+	'postgres', qq[
+	WAIT FOR LSN '${lsn_write}' MODE WRITE WITH (timeout '1d');
+	SELECT pg_lsn_cmp((SELECT written_lsn FROM pg_stat_wal_receiver), '${lsn_write}'::pg_lsn);
+]);
+
+ok((split("\n", $output))[-1] >= 0,
+	"standby wrote WAL up to target LSN after WAIT FOR MODE WRITE");
+
+$node_primary->safe_psql('postgres',
+	"INSERT INTO wait_test VALUES (generate_series(41, 50))");
+my $lsn_flush =
+  $node_primary->safe_psql('postgres', "SELECT pg_current_wal_insert_lsn()");
+$output = $node_standby->safe_psql(
+	'postgres', qq[
+	WAIT FOR LSN '${lsn_flush}' MODE FLUSH WITH (timeout '1d');
+	SELECT pg_lsn_cmp(pg_last_wal_receive_lsn(), '${lsn_flush}'::pg_lsn);
+]);
+
+ok((split("\n", $output))[-1] >= 0,
+	"standby flushed WAL up to target LSN after WAIT FOR MODE FLUSH");
+
+# 4. Check that waiting for unreachable LSN triggers the timeout.  The
 # unreachable LSN must be well in advance.  So WAL records issued by
 # the concurrent autovacuum could not affect that.
 my $lsn3 =
@@ -88,7 +147,7 @@ $output = $node_standby->safe_psql(
 	WAIT FOR LSN '${lsn3}' WITH (timeout '10ms', no_throw);]);
 ok($output eq "timeout", "WAIT FOR returns correct status after timeout");
 
-# 4. Check that WAIT FOR triggers an error if called on primary,
+# 5. Check that WAIT FOR triggers an error if called on primary,
 # within another function, or inside a transaction with an isolation level
 # higher than READ COMMITTED.
 
@@ -125,7 +184,7 @@ ok( $stderr =~
 	  /WAIT FOR must be only called without an active or registered snapshot/,
 	"get an error when running within another function");
 
-# 5. Check parameter validation error cases on standby before promotion
+# 6. Check parameter validation error cases on standby before promotion
 my $test_lsn =
   $node_primary->safe_psql('postgres', "SELECT pg_current_wal_insert_lsn()");
 
@@ -208,7 +267,7 @@ $node_standby->psql(
 ok( $stderr =~ /option "invalid_option" not recognized/,
 	"get error for invalid WITH clause option");
 
-# 6. Check the scenario of multiple LSN waiters.  We make 5 background
+# 7a. Check the scenario of multiple REPLAY waiters.  We make 5 background
 # psql sessions each waiting for a corresponding insertion.  When waiting is
 # finished, stored procedures logs if there are visible as many rows as
 # should be.
@@ -226,7 +285,9 @@ CREATE FUNCTION log_count(i int) RETURNS void AS \$\$
 \$\$
 LANGUAGE plpgsql;
 ]);
+
 $node_standby->safe_psql('postgres', "SELECT pg_wal_replay_pause();");
+
 my @psql_sessions;
 for (my $i = 0; $i < 5; $i++)
 {
@@ -239,10 +300,11 @@ for (my $i = 0; $i < 5; $i++)
 	$psql_sessions[$i]->query_until(
 		qr/start/, qq[
 		\\echo start
-		WAIT FOR LSN '${lsn}';
+		WAIT FOR LSN '${lsn}' MODE REPLAY;
 		SELECT log_count(${i});
 	]);
 }
+
 my $log_offset = -s $node_standby->logfile;
 $node_standby->safe_psql('postgres', "SELECT pg_wal_replay_resume();");
 for (my $i = 0; $i < 5; $i++)
@@ -251,23 +313,200 @@ for (my $i = 0; $i < 5; $i++)
 	$psql_sessions[$i]->quit;
 }
 
-ok(1, 'multiple LSN waiters reported consistent data');
+ok(1, 'multiple REPLAY waiters reported consistent data');
 
-# 7. Check that the standby promotion terminates the wait on LSN.  Start
-# waiting for an unreachable LSN then promote.  Check the log for the relevant
-# error message.  Also, check that waiting for already replayed LSN doesn't
-# cause an error even after promotion.
+# 7b. Check the scenario of multiple WRITE waiters.
+# Stop walreceiver to ensure waiters actually block.
+stop_walreceiver($node_standby);
+
+# Generate WAL on primary (standby won't receive it yet)
+my @write_lsns;
+for (my $i = 0; $i < 5; $i++)
+{
+	$node_primary->safe_psql('postgres',
+		"INSERT INTO wait_test VALUES (100 + ${i});");
+	$write_lsns[$i] =
+	  $node_primary->safe_psql('postgres',
+		"SELECT pg_current_wal_insert_lsn()");
+}
+
+# Start WRITE waiters (they will block since walreceiver is stopped)
+my @write_sessions;
+for (my $i = 0; $i < 5; $i++)
+{
+	$write_sessions[$i] = $node_standby->background_psql('postgres');
+	$write_sessions[$i]->query_until(
+		qr/start/, qq[
+		\\echo start
+		WAIT FOR LSN '$write_lsns[$i]' MODE WRITE WITH (timeout '1d');
+		DO \$\$ BEGIN RAISE LOG 'write_done %', $i; END \$\$;
+	]);
+}
+
+# Verify waiters are blocked
+$node_standby->poll_query_until('postgres',
+	"SELECT count(*) = 5 FROM pg_stat_activity WHERE wait_event = 'WaitForWalWrite'"
+);
+
+# Restore walreceiver to unblock waiters
+my $write_log_offset = -s $node_standby->logfile;
+resume_walreceiver($node_standby);
+
+# Wait for all waiters to complete and close sessions
+for (my $i = 0; $i < 5; $i++)
+{
+	$node_standby->wait_for_log("write_done $i", $write_log_offset);
+	$write_sessions[$i]->quit;
+}
+
+# Verify on standby that WAL was written up to the target LSN
+$output = $node_standby->safe_psql('postgres',
+	"SELECT pg_lsn_cmp((SELECT written_lsn FROM pg_stat_wal_receiver), '$write_lsns[4]'::pg_lsn);"
+);
+
+ok($output >= 0,
+	"multiple WRITE waiters: standby wrote WAL up to target LSN");
+
+# 7c. Check the scenario of multiple FLUSH waiters.
+# Stop walreceiver to ensure waiters actually block.
+stop_walreceiver($node_standby);
+
+# Generate WAL on primary (standby won't receive it yet)
+my @flush_lsns;
+for (my $i = 0; $i < 5; $i++)
+{
+	$node_primary->safe_psql('postgres',
+		"INSERT INTO wait_test VALUES (200 + ${i});");
+	$flush_lsns[$i] =
+	  $node_primary->safe_psql('postgres',
+		"SELECT pg_current_wal_insert_lsn()");
+}
+
+# Start FLUSH waiters (they will block since walreceiver is stopped)
+my @flush_sessions;
+for (my $i = 0; $i < 5; $i++)
+{
+	$flush_sessions[$i] = $node_standby->background_psql('postgres');
+	$flush_sessions[$i]->query_until(
+		qr/start/, qq[
+		\\echo start
+		WAIT FOR LSN '$flush_lsns[$i]' MODE FLUSH WITH (timeout '1d');
+		DO \$\$ BEGIN RAISE LOG 'flush_done %', $i; END \$\$;
+	]);
+}
+
+# Verify waiters are blocked
+$node_standby->poll_query_until('postgres',
+	"SELECT count(*) = 5 FROM pg_stat_activity WHERE wait_event = 'WaitForWalFlush'"
+);
+
+# Restore walreceiver to unblock waiters
+my $flush_log_offset = -s $node_standby->logfile;
+resume_walreceiver($node_standby);
+
+# Wait for all waiters to complete and close sessions
+for (my $i = 0; $i < 5; $i++)
+{
+	$node_standby->wait_for_log("flush_done $i", $flush_log_offset);
+	$flush_sessions[$i]->quit;
+}
+
+# Verify on standby that WAL was flushed up to the target LSN
+$output = $node_standby->safe_psql('postgres',
+	"SELECT pg_lsn_cmp(pg_last_wal_receive_lsn(), '$flush_lsns[4]'::pg_lsn);"
+);
+
+ok($output >= 0,
+	"multiple FLUSH waiters: standby flushed WAL up to target LSN");
+
+# 7d. Check the scenario of mixed mode waiters (REPLAY, WRITE, FLUSH)
+# running concurrently.  We start 6 sessions: 2 for each mode, all waiting
+# for the same target LSN.  We stop the walreceiver and pause replay to
+# ensure all waiters block.  Then we resume replay and restart the
+# walreceiver to verify they unblock and complete correctly.
+
+# Stop walreceiver first to ensure we can control the flow without hanging
+# (stopping it after pausing replay can hang if the startup process is paused).
+stop_walreceiver($node_standby);
+
+# Pause replay
+$node_standby->safe_psql('postgres', "SELECT pg_wal_replay_pause();");
+
+# Generate WAL on primary
+$node_primary->safe_psql('postgres',
+	"INSERT INTO wait_test VALUES (generate_series(301, 310));");
+my $mixed_target_lsn =
+  $node_primary->safe_psql('postgres', "SELECT pg_current_wal_insert_lsn()");
+
+# Start 6 waiters: 2 for each mode
+my @mixed_sessions;
+my @mixed_modes = ('REPLAY', 'WRITE', 'FLUSH');
+for (my $i = 0; $i < 6; $i++)
+{
+	$mixed_sessions[$i] = $node_standby->background_psql('postgres');
+	$mixed_sessions[$i]->query_until(
+		qr/start/, qq[
+		\\echo start
+		WAIT FOR LSN '${mixed_target_lsn}' MODE $mixed_modes[$i % 3] WITH (timeout '1d');
+		DO \$\$ BEGIN RAISE LOG 'mixed_done %', $i; END \$\$;
+	]);
+}
+
+# Verify all waiters are blocked
+$node_standby->poll_query_until('postgres',
+	"SELECT count(*) = 6 FROM pg_stat_activity WHERE wait_event LIKE 'WaitForWal%'"
+);
+
+# Resume replay (waiters should still be blocked as no WAL has arrived)
+my $mixed_log_offset = -s $node_standby->logfile;
+$node_standby->safe_psql('postgres', "SELECT pg_wal_replay_resume();");
+$node_standby->poll_query_until('postgres',
+	"SELECT NOT pg_is_wal_replay_paused();");
+
+# Restore walreceiver to allow WAL to arrive
+resume_walreceiver($node_standby);
+
+# Wait for all sessions to complete and close them
+for (my $i = 0; $i < 6; $i++)
+{
+	$node_standby->wait_for_log("mixed_done $i", $mixed_log_offset);
+	$mixed_sessions[$i]->quit;
+}
+
+# Verify all modes reached the target LSN
+$output = $node_standby->safe_psql(
+	'postgres', qq[
+	SELECT pg_lsn_cmp((SELECT written_lsn FROM pg_stat_wal_receiver), '${mixed_target_lsn}'::pg_lsn) >= 0 AND
+	       pg_lsn_cmp(pg_last_wal_receive_lsn(), '${mixed_target_lsn}'::pg_lsn) >= 0 AND
+	       pg_lsn_cmp(pg_last_wal_replay_lsn(), '${mixed_target_lsn}'::pg_lsn) >= 0;
+]);
+
+ok($output eq 't',
+	"mixed mode waiters: all modes completed and reached target LSN");
+
+# 8. Check that the standby promotion terminates all wait modes.  Start
+# waiting for unreachable LSNs with REPLAY, WRITE, and FLUSH modes, then
+# promote.  Check the log for the relevant error messages.  Also, check that
+# waiting for already replayed LSN doesn't cause an error even after promotion.
 my $lsn4 =
   $node_primary->safe_psql('postgres',
 	"SELECT pg_current_wal_insert_lsn() + 10000000000");
+
 my $lsn5 =
   $node_primary->safe_psql('postgres', "SELECT pg_current_wal_insert_lsn()");
-my $psql_session = $node_standby->background_psql('postgres');
-$psql_session->query_until(
-	qr/start/, qq[
-	\\echo start
-	WAIT FOR LSN '${lsn4}';
-]);
+
+# Start background sessions waiting for unreachable LSN with all modes
+my @wait_modes = ('REPLAY', 'WRITE', 'FLUSH');
+my @wait_sessions;
+for (my $i = 0; $i < 3; $i++)
+{
+	$wait_sessions[$i] = $node_standby->background_psql('postgres');
+	$wait_sessions[$i]->query_until(
+		qr/start/, qq[
+		\\echo start
+		WAIT FOR LSN '${lsn4}' MODE $wait_modes[$i];
+	]);
+}
 
 # Make sure standby will be promoted at least at the primary insert LSN we
 # have just observed.  Use pg_switch_wal() to force the insert LSN to be
@@ -277,17 +516,24 @@ $node_primary->wait_for_catchup($node_standby);
 
 $log_offset = -s $node_standby->logfile;
 $node_standby->promote;
-$node_standby->wait_for_log('recovery is not in progress', $log_offset);
 
-ok(1, 'got error after standby promote');
+# Wait for all three sessions to get the error (each mode has distinct message)
+$node_standby->wait_for_log(qr/Recovery ended before target LSN.*was written/,
+	$log_offset);
+$node_standby->wait_for_log(qr/Recovery ended before target LSN.*was flushed/,
+	$log_offset);
+$node_standby->wait_for_log(
+	qr/Recovery ended before target LSN.*was replayed/, $log_offset);
 
-$node_standby->safe_psql('postgres', "WAIT FOR LSN '${lsn5}';");
+ok(1, 'promotion interrupted all wait modes');
+
+$node_standby->safe_psql('postgres', "WAIT FOR LSN '${lsn5}' MODE REPLAY;");
 
 ok(1, 'wait for already replayed LSN exits immediately even after promotion');
 
 $output = $node_standby->safe_psql(
 	'postgres', qq[
-	WAIT FOR LSN '${lsn4}' WITH (timeout '10ms', no_throw);]);
+	WAIT FOR LSN '${lsn4}' MODE REPLAY WITH (timeout '10ms', no_throw);]);
 ok($output eq "not in recovery",
 	"WAIT FOR returns correct status after standby promotion");
 
@@ -295,8 +541,11 @@ ok($output eq "not in recovery",
 $node_standby->stop;
 $node_primary->stop;
 
-# If we send \q with $psql_session->quit the command can be sent to the session
+# If we send \q with $session->quit the command can be sent to the session
 # already closed. So \q is in initial script, here we only finish IPC::Run.
-$psql_session->{run}->finish;
+for (my $i = 0; $i < 3; $i++)
+{
+	$wait_sessions[$i]->{run}->finish;
+}
 
 done_testing();

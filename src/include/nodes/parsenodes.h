@@ -4413,10 +4413,21 @@ typedef struct DropSubscriptionStmt
 	DropBehavior behavior;		/* RESTRICT or CASCADE behavior */
 } DropSubscriptionStmt;
 
+/*
+ * WaitLSNMode - MODE parameter for WAIT FOR command
+ */
+typedef enum WaitLSNMode
+{
+	WAIT_LSN_MODE_REPLAY,		/* Wait for LSN replay on standby */
+	WAIT_LSN_MODE_WRITE,		/* Wait for LSN write on standby */
+	WAIT_LSN_MODE_FLUSH			/* Wait for LSN flush on standby */
+}			WaitLSNMode;
+
 typedef struct WaitStmt
 {
 	NodeTag		type;
 	char	   *lsn_literal;	/* LSN string from grammar */
+	WaitLSNMode mode;			/* Wait mode: REPLAY/FLUSH/WRITE */
 	List	   *options;		/* List of DefElem nodes */
 } WaitStmt;
 

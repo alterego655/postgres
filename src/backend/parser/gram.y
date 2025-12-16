@@ -641,6 +641,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <windef>	window_definition over_clause window_specification
 				opt_frame_clause frame_extent frame_bound
 %type <ival>	null_treatment opt_window_exclusion_clause
+%type <ival>	opt_wait_lsn_mode
 %type <str>		opt_existing_window_name
 %type <boolean> opt_if_not_exists
 %type <boolean> opt_unique_null_treatment
@@ -732,7 +733,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ESCAPE EVENT EXCEPT EXCLUDE EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPLAIN
 	EXPRESSION EXTENSION EXTERNAL EXTRACT
 
-	FALSE_P FAMILY FETCH FILTER FINALIZE FIRST_P FLOAT_P FOLLOWING FOR
+	FALSE_P FAMILY FETCH FILTER FINALIZE FIRST_P FLOAT_P FLUSH FOLLOWING FOR
 	FORCE FOREIGN FORMAT FORWARD FREEZE FROM FULL FUNCTION FUNCTIONS
 
 	GENERATED GLOBAL GRANT GRANTED GREATEST GROUP_P GROUPING GROUPS
@@ -773,7 +774,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	QUOTE QUOTES
 
 	RANGE READ REAL REASSIGN RECURSIVE REF_P REFERENCES REFERENCING
-	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
+	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLAY REPLICA
 	RESET RESPECT_P RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
@@ -16541,13 +16542,21 @@ xml_passing_mech:
  *****************************************************************************/
 
 WaitStmt:
-			WAIT FOR LSN_P Sconst opt_wait_with_clause
+			WAIT FOR LSN_P Sconst opt_wait_lsn_mode opt_wait_with_clause
 				{
 					WaitStmt *n = makeNode(WaitStmt);
 					n->lsn_literal = $4;
-					n->options = $5;
+					n->mode = $5;
+					n->options = $6;
 					$$ = (Node *) n;
 				}
+			;
+
+opt_wait_lsn_mode:
+			MODE REPLAY			{ $$ = WAIT_LSN_MODE_REPLAY; }
+			| MODE FLUSH		{ $$ = WAIT_LSN_MODE_FLUSH; }
+			| MODE WRITE		{ $$ = WAIT_LSN_MODE_WRITE; }
+			| /*EMPTY*/			{ $$ = WAIT_LSN_MODE_REPLAY; }
 			;
 
 opt_wait_with_clause:
@@ -17989,6 +17998,7 @@ unreserved_keyword:
 			| FILTER
 			| FINALIZE
 			| FIRST_P
+			| FLUSH
 			| FOLLOWING
 			| FORCE
 			| FORMAT
@@ -18124,6 +18134,7 @@ unreserved_keyword:
 			| RENAME
 			| REPEATABLE
 			| REPLACE
+			| REPLAY
 			| REPLICA
 			| RESET
 			| RESPECT_P
@@ -18578,6 +18589,7 @@ bare_label_keyword:
 			| FINALIZE
 			| FIRST_P
 			| FLOAT_P
+			| FLUSH
 			| FOLLOWING
 			| FORCE
 			| FOREIGN
@@ -18761,6 +18773,7 @@ bare_label_keyword:
 			| RENAME
 			| REPEATABLE
 			| REPLACE
+			| REPLAY
 			| REPLICA
 			| RESET
 			| RESTART
