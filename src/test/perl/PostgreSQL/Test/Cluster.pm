@@ -3335,6 +3335,9 @@ sub wait_for_catchup
 	$mode = defined($mode) ? $mode : 'replay';
 	my %valid_modes =
 	  ('sent' => 1, 'write' => 1, 'flush' => 1, 'replay' => 1);
+	my $isrecovery =
+	  $self->safe_psql('postgres', "SELECT pg_is_in_recovery()");
+	chomp($isrecovery);
 	croak "unknown mode $mode for 'wait_for_catchup', valid modes are "
 	  . join(', ', keys(%valid_modes))
 	  unless exists($valid_modes{$mode});
@@ -3347,9 +3350,6 @@ sub wait_for_catchup
 	}
 	if (!defined($target_lsn))
 	{
-		my $isrecovery =
-		  $self->safe_psql('postgres', "SELECT pg_is_in_recovery()");
-		chomp($isrecovery);
 		if ($isrecovery eq 't')
 		{
 			$target_lsn = $self->lsn('replay');
@@ -3367,6 +3367,35 @@ sub wait_for_catchup
 	  . $self->name . "\n";
 	# Before release 12 walreceiver just set the application name to
 	# "walreceiver"
+
+	# Use WAIT FOR LSN when in recovery for supported modes (replay, write, flush)
+	# This is more efficient than polling pg_stat_replication
+	if (($mode ne 'sent') && ($isrecovery eq 't'))
+	{
+		my $timeout = $PostgreSQL::Test::Utils::timeout_default;
+		# Map mode names to WAIT FOR LSN MODE values (uppercase)
+		my $wait_mode = uc($mode);
+		my $query =
+		  qq[WAIT FOR LSN '${target_lsn}' MODE ${wait_mode} WITH (timeout '${timeout}s', no_throw);];
+		my $output = $self->safe_psql('postgres', $query);
+		chomp($output);
+
+		if ($output ne 'success')
+		{
+			# Fetch additional detail for debugging purposes
+			$query = qq[SELECT * FROM pg_catalog.pg_stat_replication];
+			my $details = $self->safe_psql('postgres', $query);
+			diag qq(WAIT FOR LSN failed with status:
+${output});
+			diag qq(Last pg_stat_replication contents:
+${details});
+			croak "failed waiting for catchup";
+		}
+		print "done\n";
+		return;
+	}
+
+	# Polling for 'sent' mode or when not in recovery (WAIT FOR LSN not applicable)
 	my $query = qq[SELECT '$target_lsn' <= ${mode}_lsn AND state = 'streaming'
          FROM pg_catalog.pg_stat_replication
          WHERE application_name IN ('$standby_name', 'walreceiver')];
