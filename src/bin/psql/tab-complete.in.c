@@ -5327,10 +5327,11 @@ match_previous_words(int pattern_id,
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_vacuumables);
 
 /*
- * WAIT FOR LSN '<lsn>' [ WITH ( option [, ...] ) ]
+ * WAIT FOR LSN '<lsn>' [ MODE { REPLAY | FLUSH | WRITE } ] [ WITH ( option [, ...] ) ]
  * where option can be:
  *   TIMEOUT '<timeout>'
  *   NO_THROW
+ * MODE defaults to REPLAY if not specified.
  */
 	else if (Matches("WAIT"))
 		COMPLETE_WITH("FOR");
@@ -5339,25 +5340,41 @@ match_previous_words(int pattern_id,
 	else if (Matches("WAIT", "FOR", "LSN"))
 		/* No completion for LSN value - user must provide manually */
 		;
+
+	/*
+	 * After LSN value, offer MODE (optional) or WITH, since MODE defaults to
+	 * REPLAY
+	 */
 	else if (Matches("WAIT", "FOR", "LSN", MatchAny))
+		COMPLETE_WITH("MODE", "WITH");
+	else if (Matches("WAIT", "FOR", "LSN", MatchAny, "MODE"))
+		COMPLETE_WITH("REPLAY", "FLUSH", "WRITE");
+	else if (Matches("WAIT", "FOR", "LSN", MatchAny, "MODE", MatchAny))
 		COMPLETE_WITH("WITH");
+	/* WITH directly after LSN (using default REPLAY mode) */
 	else if (Matches("WAIT", "FOR", "LSN", MatchAny, "WITH"))
 		COMPLETE_WITH("(");
+	else if (Matches("WAIT", "FOR", "LSN", MatchAny, "MODE", MatchAny, "WITH"))
+		COMPLETE_WITH("(");
+
+	/*
+	 * Handle parenthesized option list (both with and without explicit MODE).
+	 * This fires when we're in an unfinished parenthesized option list.
+	 * get_previous_words treats a completed parenthesized option list as one
+	 * word, so the above test is correct. timeout takes a string value,
+	 * no_throw takes no value. We don't offer completions for these values.
+	 */
 	else if (HeadMatches("WAIT", "FOR", "LSN", MatchAny, "WITH", "(*") &&
 			 !HeadMatches("WAIT", "FOR", "LSN", MatchAny, "WITH", "(*)"))
 	{
-		/*
-		 * This fires if we're in an unfinished parenthesized option list.
-		 * get_previous_words treats a completed parenthesized option list as
-		 * one word, so the above test is correct.
-		 */
 		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
 			COMPLETE_WITH("timeout", "no_throw");
-
-		/*
-		 * timeout takes a string value, no_throw takes no value. We don't
-		 * offer completions for these values.
-		 */
+	}
+	else if (HeadMatches("WAIT", "FOR", "LSN", MatchAny, "MODE", MatchAny, "WITH", "(*") &&
+			 !HeadMatches("WAIT", "FOR", "LSN", MatchAny, "MODE", MatchAny, "WITH", "(*)"))
+	{
+		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
+			COMPLETE_WITH("timeout", "no_throw");
 	}
 
 /* WITH [RECURSIVE] */
