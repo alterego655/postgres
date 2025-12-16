@@ -335,7 +335,7 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 				if (avail > maxread)
 					avail = maxread;
 				pq_copymsgbytes(cstate->fe_msgbuf, databuf, avail);
-				databuf = (void *) ((char *) databuf + avail);
+				databuf = (char *) databuf + avail;
 				maxread -= avail;
 				bytesread += avail;
 			}
@@ -1136,7 +1136,7 @@ CopyFromBinaryOneRow(CopyFromState cstate, ExprContext *econtext, Datum *values,
 		ereport(ERROR,
 				(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 				 errmsg("row field count is %d, expected %d",
-						(int) fld_count, attr_count)));
+						fld_count, attr_count)));
 
 	foreach(cur, cstate->attnumlist)
 	{

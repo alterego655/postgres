@@ -233,6 +233,20 @@ typedef struct
 	int			write_head;
 	int			read_heads[NUM_SYNC_REP_WAIT_MODE];
 	WalTimeSample last_read[NUM_SYNC_REP_WAIT_MODE];
+
+	/*
+	 * Overflow entries for read heads that collide with the write head.
+	 *
+	 * When the cyclic buffer fills (write head is about to collide with a
+	 * read head), we save that read head's current sample here and mark it as
+	 * using overflow (read_heads[i] = -1). This allows the write head to
+	 * continue advancing while the overflowed mode continues lag computation
+	 * using the saved sample.
+	 *
+	 * Once the standby's reported LSN advances past the overflow entry's LSN,
+	 * we transition back to normal buffer-based tracking.
+	 */
+	WalTimeSample overflowed[NUM_SYNC_REP_WAIT_MODE];
 } LagTracker;
 
 static LagTracker *lag_tracker;
@@ -515,7 +529,7 @@ ReadReplicationSlot(ReadReplicationSlotCmd *cmd)
 		i++;
 
 		/* start LSN */
-		if (!XLogRecPtrIsInvalid(slot_contents.data.restart_lsn))
+		if (XLogRecPtrIsValid(slot_contents.data.restart_lsn))
 		{
 			char		xloc[64];
 
@@ -527,7 +541,7 @@ ReadReplicationSlot(ReadReplicationSlotCmd *cmd)
 		i++;
 
 		/* timeline this WAL was produced on */
-		if (!XLogRecPtrIsInvalid(slot_contents.data.restart_lsn))
+		if (XLogRecPtrIsValid(slot_contents.data.restart_lsn))
 		{
 			TimeLineID	slots_position_timeline;
 			TimeLineID	current_timeline;
@@ -892,7 +906,7 @@ StartReplication(StartReplicationCmd *cmd)
 			 * that's older than the switchpoint, if it's still in the same
 			 * WAL segment.
 			 */
-			if (!XLogRecPtrIsInvalid(switchpoint) &&
+			if (XLogRecPtrIsValid(switchpoint) &&
 				switchpoint < cmd->startpoint)
 			{
 				ereport(ERROR,
@@ -1138,8 +1152,8 @@ parseCreateReplSlotOptions(CreateReplicationSlotCmd *cmd,
 			else
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unrecognized value for CREATE_REPLICATION_SLOT option \"%s\": \"%s\"",
-								defel->defname, action)));
+						 errmsg("unrecognized value for %s option \"%s\": \"%s\"",
+								"CREATE_REPLICATION_SLOT", defel->defname, action)));
 		}
 		else if (strcmp(defel->defname, "reserve_wal") == 0)
 		{
@@ -1813,7 +1827,7 @@ WalSndWaitForWal(XLogRecPtr loc)
 	 * receipt of WAL up to RecentFlushPtr. This is particularly interesting
 	 * if we're far behind.
 	 */
-	if (!XLogRecPtrIsInvalid(RecentFlushPtr) &&
+	if (XLogRecPtrIsValid(RecentFlushPtr) &&
 		!NeedToWaitForWal(loc, RecentFlushPtr, &wait_event))
 		return RecentFlushPtr;
 
@@ -2383,7 +2397,7 @@ PhysicalConfirmReceivedLocation(XLogRecPtr lsn)
 	bool		changed = false;
 	ReplicationSlot *slot = MyReplicationSlot;
 
-	Assert(lsn != InvalidXLogRecPtr);
+	Assert(XLogRecPtrIsValid(lsn));
 	SpinLockAcquire(&slot->mutex);
 	if (slot->data.restart_lsn != lsn)
 	{
@@ -2505,7 +2519,7 @@ ProcessStandbyReplyMessage(void)
 	/*
 	 * Advance our local xmin horizon when the client confirmed a flush.
 	 */
-	if (MyReplicationSlot && flushPtr != InvalidXLogRecPtr)
+	if (MyReplicationSlot && XLogRecPtrIsValid(flushPtr))
 	{
 		if (SlotIsLogical(MyReplicationSlot))
 			LogicalConfirmReceivedLocation(flushPtr);
@@ -3060,7 +3074,7 @@ InitWalSenderSlot(void)
 
 			SpinLockRelease(&walsnd->mutex);
 			/* don't need the lock anymore */
-			MyWalSnd = (WalSnd *) walsnd;
+			MyWalSnd = walsnd;
 
 			break;
 		}
@@ -3522,7 +3536,7 @@ XLogSendLogical(void)
 	 * If first time through in this session, initialize flushPtr.  Otherwise,
 	 * we only need to update flushPtr if EndRecPtr is past it.
 	 */
-	if (flushPtr == InvalidXLogRecPtr ||
+	if (!XLogRecPtrIsValid(flushPtr) ||
 		logical_decoding_ctx->reader->EndRecPtr >= flushPtr)
 	{
 		/*
@@ -3583,8 +3597,8 @@ WalSndDone(WalSndSendDataCallback send_data)
 	 * flush location if valid, write otherwise. Tools like pg_receivewal will
 	 * usually (unless in synchronous mode) return an invalid flush location.
 	 */
-	replicatedPtr = XLogRecPtrIsInvalid(MyWalSnd->flush) ?
-		MyWalSnd->write : MyWalSnd->flush;
+	replicatedPtr = XLogRecPtrIsValid(MyWalSnd->flush) ?
+		MyWalSnd->flush : MyWalSnd->write;
 
 	if (WalSndCaughtUp && sentPtr == replicatedPtr &&
 		!pq_is_send_pending())
@@ -3959,7 +3973,7 @@ WalSndGetStateString(WalSndState state)
 static Interval *
 offset_to_interval(TimeOffset offset)
 {
-	Interval   *result = palloc(sizeof(Interval));
+	Interval   *result = palloc_object(Interval);
 
 	result->month = 0;
 	result->day = 0;
@@ -4059,19 +4073,19 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 		{
 			values[1] = CStringGetTextDatum(WalSndGetStateString(state));
 
-			if (XLogRecPtrIsInvalid(sent_ptr))
+			if (!XLogRecPtrIsValid(sent_ptr))
 				nulls[2] = true;
 			values[2] = LSNGetDatum(sent_ptr);
 
-			if (XLogRecPtrIsInvalid(write))
+			if (!XLogRecPtrIsValid(write))
 				nulls[3] = true;
 			values[3] = LSNGetDatum(write);
 
-			if (XLogRecPtrIsInvalid(flush))
+			if (!XLogRecPtrIsValid(flush))
 				nulls[4] = true;
 			values[4] = LSNGetDatum(flush);
 
-			if (XLogRecPtrIsInvalid(apply))
+			if (!XLogRecPtrIsValid(apply))
 				nulls[5] = true;
 			values[5] = LSNGetDatum(apply);
 
@@ -4080,7 +4094,7 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 			 * which always returns an invalid flush location, as an
 			 * asynchronous standby.
 			 */
-			priority = XLogRecPtrIsInvalid(flush) ? 0 : priority;
+			priority = XLogRecPtrIsValid(flush) ? priority : 0;
 
 			if (writeLag < 0)
 				nulls[6] = true;
@@ -4151,7 +4165,7 @@ WalSndKeepalive(bool requestReply, XLogRecPtr writePtr)
 	/* construct the message... */
 	resetStringInfo(&output_message);
 	pq_sendbyte(&output_message, PqReplMsg_Keepalive);
-	pq_sendint64(&output_message, XLogRecPtrIsInvalid(writePtr) ? sentPtr : writePtr);
+	pq_sendint64(&output_message, XLogRecPtrIsValid(writePtr) ? writePtr : sentPtr);
 	pq_sendint64(&output_message, GetCurrentTimestamp());
 	pq_sendbyte(&output_message, requestReply ? 1 : 0);
 
@@ -4207,7 +4221,6 @@ WalSndKeepaliveIfNecessary(void)
 static void
 LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time)
 {
-	bool		buffer_full;
 	int			new_write_head;
 	int			i;
 
@@ -4229,25 +4242,19 @@ LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time)
 	 * of space.
 	 */
 	new_write_head = (lag_tracker->write_head + 1) % LAG_TRACKER_BUFFER_SIZE;
-	buffer_full = false;
 	for (i = 0; i < NUM_SYNC_REP_WAIT_MODE; ++i)
 	{
+		/*
+		 * If the buffer is full, move the slowest reader to a separate
+		 * overflow entry and free its space in the buffer so the write head
+		 * can advance.
+		 */
 		if (new_write_head == lag_tracker->read_heads[i])
-			buffer_full = true;
-	}
-
-	/*
-	 * If the buffer is full, for now we just rewind by one slot and overwrite
-	 * the last sample, as a simple (if somewhat uneven) way to lower the
-	 * sampling rate.  There may be better adaptive compaction algorithms.
-	 */
-	if (buffer_full)
-	{
-		new_write_head = lag_tracker->write_head;
-		if (lag_tracker->write_head > 0)
-			lag_tracker->write_head--;
-		else
-			lag_tracker->write_head = LAG_TRACKER_BUFFER_SIZE - 1;
+		{
+			lag_tracker->overflowed[i] =
+				lag_tracker->buffer[lag_tracker->read_heads[i]];
+			lag_tracker->read_heads[i] = -1;
+		}
 	}
 
 	/* Store a sample at the current write head position. */
@@ -4273,6 +4280,28 @@ static TimeOffset
 LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now)
 {
 	TimestampTz time = 0;
+
+	/*
+	 * If 'lsn' has not passed the WAL position stored in the overflow entry,
+	 * return the elapsed time (in microseconds) since the saved local flush
+	 * time. If the flush time is in the future (due to clock drift), return
+	 * -1 to treat as no valid sample.
+	 *
+	 * Otherwise, switch back to using the buffer to control the read head and
+	 * compute the elapsed time.  The read head is then reset to point to the
+	 * oldest entry in the buffer.
+	 */
+	if (lag_tracker->read_heads[head] == -1)
+	{
+		if (lag_tracker->overflowed[head].lsn > lsn)
+			return (now >= lag_tracker->overflowed[head].time) ?
+				now - lag_tracker->overflowed[head].time : -1;
+
+		time = lag_tracker->overflowed[head].time;
+		lag_tracker->last_read[head] = lag_tracker->overflowed[head];
+		lag_tracker->read_heads[head] =
+			(lag_tracker->write_head + 1) % LAG_TRACKER_BUFFER_SIZE;
+	}
 
 	/* Read all unread samples up to this LSN or end of buffer. */
 	while (lag_tracker->read_heads[head] != lag_tracker->write_head &&

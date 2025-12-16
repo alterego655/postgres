@@ -30,19 +30,20 @@ static int	vacuum_one_database(ConnParams *cparams,
 								SimpleStringList *objects,
 								SimpleStringList **found_objs,
 								int concurrentCons,
-								const char *progname, bool echo, bool quiet);
+								const char *progname);
 static int	vacuum_all_databases(ConnParams *cparams,
 								 vacuumingOptions *vacopts,
 								 SimpleStringList *objects,
 								 int concurrentCons,
-								 const char *progname, bool echo, bool quiet);
+								 const char *progname);
 static SimpleStringList *retrieve_objects(PGconn *conn,
 										  vacuumingOptions *vacopts,
-										  SimpleStringList *objects,
-										  bool echo);
+										  SimpleStringList *objects);
+static void free_retrieved_objects(SimpleStringList *list);
 static void prepare_vacuum_command(PGconn *conn, PQExpBuffer sql,
 								   vacuumingOptions *vacopts, const char *table);
-static void run_vacuum_command(PGconn *conn, const char *sql, bool echo,
+static void run_vacuum_command(ParallelSlot *free_slot,
+							   vacuumingOptions *vacopts, const char *sql,
 							   const char *table);
 
 /*
@@ -55,7 +56,7 @@ vacuuming_main(ConnParams *cparams, const char *dbname,
 			   const char *maintenance_db, vacuumingOptions *vacopts,
 			   SimpleStringList *objects,
 			   unsigned int tbl_count, int concurrentCons,
-			   const char *progname, bool echo, bool quiet)
+			   const char *progname)
 {
 	setup_cancel_handler(NULL);
 
@@ -70,7 +71,7 @@ vacuuming_main(ConnParams *cparams, const char *dbname,
 		return vacuum_all_databases(cparams, vacopts,
 									objects,
 									concurrentCons,
-									progname, echo, quiet);
+									progname);
 	}
 	else
 	{
@@ -99,11 +100,15 @@ vacuuming_main(ConnParams *cparams, const char *dbname,
 										  objects,
 										  vacopts->missing_stats_only ? &found_objs : NULL,
 										  concurrentCons,
-										  progname, echo, quiet);
+										  progname);
 				if (ret != 0)
+				{
+					free_retrieved_objects(found_objs);
 					return ret;
+				}
 			}
 
+			free_retrieved_objects(found_objs);
 			return EXIT_SUCCESS;
 		}
 		else
@@ -111,7 +116,7 @@ vacuuming_main(ConnParams *cparams, const char *dbname,
 									   ANALYZE_NO_STAGE,
 									   objects, NULL,
 									   concurrentCons,
-									   progname, echo, quiet);
+									   progname);
 	}
 }
 
@@ -162,7 +167,7 @@ vacuum_one_database(ConnParams *cparams,
 					SimpleStringList *objects,
 					SimpleStringList **found_objs,
 					int concurrentCons,
-					const char *progname, bool echo, bool quiet)
+					const char *progname)
 {
 	PQExpBufferData sql;
 	PGconn	   *conn;
@@ -171,6 +176,7 @@ vacuum_one_database(ConnParams *cparams,
 	int			ntups = 0;
 	const char *initcmd;
 	SimpleStringList *retobjs = NULL;
+	bool		free_retobjs = false;
 	int			ret = EXIT_SUCCESS;
 	const char *stage_commands[] = {
 		"SET default_statistics_target=1; SET vacuum_cost_delay=0;",
@@ -186,7 +192,7 @@ vacuum_one_database(ConnParams *cparams,
 	Assert(stage == ANALYZE_NO_STAGE ||
 		   (stage >= 0 && stage < ANALYZE_NUM_STAGES));
 
-	conn = connectDatabase(cparams, progname, echo, false, true);
+	conn = connectDatabase(cparams, progname, vacopts->echo, false, true);
 
 	if (vacopts->disable_page_skipping && PQserverVersion(conn) < 90600)
 	{
@@ -275,7 +281,7 @@ vacuum_one_database(ConnParams *cparams,
 	/* skip_database_stats is used automatically if server supports it */
 	vacopts->skip_database_stats = (PQserverVersion(conn) >= 160000);
 
-	if (!quiet)
+	if (!vacopts->quiet)
 	{
 		if (vacopts->mode == MODE_ANALYZE_IN_STAGES)
 			printf(_("%s: processing database \"%s\": %s\n"),
@@ -289,27 +295,32 @@ vacuum_one_database(ConnParams *cparams,
 	/*
 	 * If the caller provided the results of a previous catalog query, just
 	 * use that.  Otherwise, run the catalog query ourselves and set the
-	 * return variable if provided.
+	 * return variable if provided.  (If it is, then freeing the string list
+	 * becomes the caller's responsibility.)
 	 */
 	if (found_objs && *found_objs)
 		retobjs = *found_objs;
 	else
 	{
-		retobjs = retrieve_objects(conn, vacopts, objects, echo);
+		retobjs = retrieve_objects(conn, vacopts, objects);
 		if (found_objs)
 			*found_objs = retobjs;
+		else
+			free_retobjs = true;
 	}
 
 	/*
 	 * Count the number of objects in the catalog query result.  If there are
 	 * none, we are done.
 	 */
-	for (cell = retobjs ? retobjs->head : NULL; cell; cell = cell->next)
+	for (cell = retobjs->head; cell; cell = cell->next)
 		ntups++;
 
 	if (ntups == 0)
 	{
 		PQfinish(conn);
+		if (free_retobjs)
+			free_retrieved_objects(retobjs);
 		return EXIT_SUCCESS;
 	}
 
@@ -330,7 +341,11 @@ vacuum_one_database(ConnParams *cparams,
 	if (vacopts->mode == MODE_ANALYZE_IN_STAGES)
 	{
 		initcmd = stage_commands[stage];
-		executeCommand(conn, initcmd, echo);
+
+		if (vacopts->dry_run)
+			printf("%s\n", initcmd);
+		else
+			executeCommand(conn, initcmd, vacopts->echo);
 	}
 	else
 		initcmd = NULL;
@@ -340,7 +355,8 @@ vacuum_one_database(ConnParams *cparams,
 	 * for the first slot.  If not in parallel mode, the first slot in the
 	 * array contains the connection.
 	 */
-	sa = ParallelSlotsSetup(concurrentCons, cparams, progname, echo, initcmd);
+	sa = ParallelSlotsSetup(concurrentCons, cparams, progname,
+							vacopts->echo, initcmd);
 	ParallelSlotsAdoptConn(sa, conn);
 
 	initPQExpBuffer(&sql);
@@ -372,8 +388,7 @@ vacuum_one_database(ConnParams *cparams,
 		 * through ParallelSlotsGetIdle.
 		 */
 		ParallelSlotSetHandler(free_slot, TableCommandResultHandler, NULL);
-		run_vacuum_command(free_slot->connection, sql.data,
-						   echo, tabname);
+		run_vacuum_command(free_slot, vacopts, sql.data, tabname);
 
 		cell = cell->next;
 	} while (cell != NULL);
@@ -397,7 +412,7 @@ vacuum_one_database(ConnParams *cparams,
 		}
 
 		ParallelSlotSetHandler(free_slot, TableCommandResultHandler, NULL);
-		run_vacuum_command(free_slot->connection, cmd, echo, NULL);
+		run_vacuum_command(free_slot, vacopts, cmd, NULL);
 
 		if (!ParallelSlotsWaitCompletion(sa))
 			ret = EXIT_FAILURE; /* error already reported by handler */
@@ -407,6 +422,8 @@ finish:
 	ParallelSlotsTerminate(sa);
 	pg_free(sa);
 	termPQExpBuffer(&sql);
+	if (free_retobjs)
+		free_retrieved_objects(retobjs);
 
 	return ret;
 }
@@ -423,15 +440,18 @@ vacuum_all_databases(ConnParams *cparams,
 					 vacuumingOptions *vacopts,
 					 SimpleStringList *objects,
 					 int concurrentCons,
-					 const char *progname, bool echo, bool quiet)
+					 const char *progname)
 {
+	int			ret = EXIT_SUCCESS;
 	PGconn	   *conn;
 	PGresult   *result;
+	int			numdbs;
 
-	conn = connectMaintenanceDatabase(cparams, progname, echo);
+	conn = connectMaintenanceDatabase(cparams, progname, vacopts->echo);
 	result = executeQuery(conn,
 						  "SELECT datname FROM pg_database WHERE datallowconn AND datconnlimit <> -2 ORDER BY 1;",
-						  echo);
+						  vacopts->echo);
+	numdbs = PQntuples(result);
 	PQfinish(conn);
 
 	if (vacopts->mode == MODE_ANALYZE_IN_STAGES)
@@ -439,7 +459,7 @@ vacuum_all_databases(ConnParams *cparams,
 		SimpleStringList **found_objs = NULL;
 
 		if (vacopts->missing_stats_only)
-			found_objs = palloc0(PQntuples(result) * sizeof(SimpleStringList *));
+			found_objs = palloc0(numdbs * sizeof(SimpleStringList *));
 
 		/*
 		 * When analyzing all databases in stages, we analyze them all in the
@@ -451,42 +471,47 @@ vacuum_all_databases(ConnParams *cparams,
 		 */
 		for (int stage = 0; stage < ANALYZE_NUM_STAGES; stage++)
 		{
-			for (int i = 0; i < PQntuples(result); i++)
+			for (int i = 0; i < numdbs; i++)
 			{
-				int			ret;
-
 				cparams->override_dbname = PQgetvalue(result, i, 0);
 				ret = vacuum_one_database(cparams, vacopts, stage,
 										  objects,
 										  vacopts->missing_stats_only ? &found_objs[i] : NULL,
 										  concurrentCons,
-										  progname, echo, quiet);
+										  progname);
 				if (ret != EXIT_SUCCESS)
-					return ret;
+					break;
 			}
+			if (ret != EXIT_SUCCESS)
+				break;
+		}
+
+		if (vacopts->missing_stats_only)
+		{
+			for (int i = 0; i < numdbs; i++)
+				free_retrieved_objects(found_objs[i]);
+			pg_free(found_objs);
 		}
 	}
 	else
 	{
-		for (int i = 0; i < PQntuples(result); i++)
+		for (int i = 0; i < numdbs; i++)
 		{
-			int			ret;
-
 			cparams->override_dbname = PQgetvalue(result, i, 0);
 			ret = vacuum_one_database(cparams, vacopts,
 									  ANALYZE_NO_STAGE,
 									  objects,
 									  NULL,
 									  concurrentCons,
-									  progname, echo, quiet);
+									  progname);
 			if (ret != EXIT_SUCCESS)
-				return ret;
+				break;
 		}
 	}
 
 	PQclear(result);
 
-	return EXIT_SUCCESS;
+	return ret;
 }
 
 /*
@@ -503,13 +528,13 @@ vacuum_all_databases(ConnParams *cparams,
  */
 static SimpleStringList *
 retrieve_objects(PGconn *conn, vacuumingOptions *vacopts,
-				 SimpleStringList *objects, bool echo)
+				 SimpleStringList *objects)
 {
 	PQExpBufferData buf;
 	PQExpBufferData catalog_query;
 	PGresult   *res;
 	SimpleStringListCell *cell;
-	SimpleStringList *found_objs = palloc0(sizeof(SimpleStringList));
+	SimpleStringList *found_objs = palloc0_object(SimpleStringList);
 	bool		objects_listed = false;
 
 	initPQExpBuffer(&catalog_query);
@@ -755,10 +780,10 @@ retrieve_objects(PGconn *conn, vacuumingOptions *vacopts,
 	 * query for consistency with table lookups done elsewhere by the user.
 	 */
 	appendPQExpBufferStr(&catalog_query, " ORDER BY c.relpages DESC;");
-	executeCommand(conn, "RESET search_path;", echo);
-	res = executeQuery(conn, catalog_query.data, echo);
+	executeCommand(conn, "RESET search_path;", vacopts->echo);
+	res = executeQuery(conn, catalog_query.data, vacopts->echo);
 	termPQExpBuffer(&catalog_query);
-	PQclear(executeQuery(conn, ALWAYS_SECURE_SEARCH_PATH_SQL, echo));
+	PQclear(executeQuery(conn, ALWAYS_SECURE_SEARCH_PATH_SQL, vacopts->echo));
 
 	/*
 	 * Build qualified identifiers for each table, including the column list
@@ -782,6 +807,22 @@ retrieve_objects(PGconn *conn, vacuumingOptions *vacopts,
 	PQclear(res);
 
 	return found_objs;
+}
+
+/*
+ * Free the results of retrieve_objects().
+ *
+ * For caller convenience, we allow the argument to be NULL,
+ * although retrieve_objects() will never return that.
+ */
+static void
+free_retrieved_objects(SimpleStringList *list)
+{
+	if (list)
+	{
+		simple_string_list_destroy(list);
+		pg_free(list);
+	}
 }
 
 /*
@@ -959,20 +1000,25 @@ prepare_vacuum_command(PGconn *conn, PQExpBuffer sql,
 
 /*
  * Send a vacuum/analyze command to the server, returning after sending the
- * command.
+ * command.  If dry_run is true, the command is printed but not sent to the
+ * server.
  *
  * Any errors during command execution are reported to stderr.
  */
 static void
-run_vacuum_command(PGconn *conn, const char *sql, bool echo,
-				   const char *table)
+run_vacuum_command(ParallelSlot *free_slot, vacuumingOptions *vacopts,
+				   const char *sql, const char *table)
 {
-	bool		status;
+	bool		status = true;
+	PGconn	   *conn = free_slot->connection;
 
-	if (echo)
+	if (vacopts->echo || vacopts->dry_run)
 		printf("%s\n", sql);
 
-	status = PQsendQuery(conn, sql) == 1;
+	if (vacopts->dry_run)
+		ParallelSlotSetIdle(free_slot);
+	else
+		status = PQsendQuery(conn, sql) == 1;
 
 	if (!status)
 	{

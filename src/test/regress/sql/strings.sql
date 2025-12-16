@@ -82,6 +82,22 @@ SELECT reverse(''::bytea);
 SELECT reverse('\xaa'::bytea);
 SELECT reverse('\xabcd'::bytea);
 
+SELECT ('\x' || repeat(' ', 32))::bytea;
+SELECT ('\x' || repeat('!', 32))::bytea;
+SELECT ('\x' || repeat('/', 34))::bytea;
+SELECT ('\x' || repeat('0', 34))::bytea;
+SELECT ('\x' || repeat('9', 32))::bytea;
+SELECT ('\x' || repeat(':', 32))::bytea;
+SELECT ('\x' || repeat('@', 34))::bytea;
+SELECT ('\x' || repeat('A', 34))::bytea;
+SELECT ('\x' || repeat('F', 32))::bytea;
+SELECT ('\x' || repeat('G', 32))::bytea;
+SELECT ('\x' || repeat('`', 34))::bytea;
+SELECT ('\x' || repeat('a', 34))::bytea;
+SELECT ('\x' || repeat('f', 32))::bytea;
+SELECT ('\x' || repeat('g', 32))::bytea;
+SELECT ('\x' || repeat('~', 34))::bytea;
+
 SET bytea_output TO escape;
 SELECT E'\\xDeAdBeEf'::bytea;
 SELECT E'\\x De Ad Be Ef '::bytea;
@@ -798,6 +814,10 @@ SELECT decode(encode(('\x' || repeat('1234567890abcdef0001', 7))::bytea,
                      'base64'), 'base64');
 SELECT encode('\x1234567890abcdef00', 'escape');
 SELECT decode(encode('\x1234567890abcdef00', 'escape'), 'escape');
+
+-- report an error with a hint listing valid encodings when an invalid encoding is specified
+SELECT encode('\x01'::bytea, 'invalid');  -- error
+SELECT decode('00', 'invalid');           -- error
 
 --
 -- base64url encoding/decoding

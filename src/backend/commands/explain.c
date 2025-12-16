@@ -351,7 +351,7 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
 	INSTR_TIME_SET_CURRENT(planstart);
 
 	/* plan the query */
-	plan = pg_plan_query(query, queryString, cursorOptions, params);
+	plan = pg_plan_query(query, queryString, cursorOptions, params, es);
 
 	INSTR_TIME_SET_CURRENT(planduration);
 	INSTR_TIME_SUBTRACT(planduration, planstart);
@@ -4283,7 +4283,8 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 	{
 		/* Show only positive counter values. */
 		if ((usage->wal_records > 0) || (usage->wal_fpi > 0) ||
-			(usage->wal_bytes > 0) || (usage->wal_buffers_full > 0))
+			(usage->wal_bytes > 0) || (usage->wal_buffers_full > 0) ||
+			(usage->wal_fpi_bytes > 0))
 		{
 			ExplainIndentText(es);
 			appendStringInfoString(es->str, "WAL:");
@@ -4297,6 +4298,9 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 			if (usage->wal_bytes > 0)
 				appendStringInfo(es->str, " bytes=%" PRIu64,
 								 usage->wal_bytes);
+			if (usage->wal_fpi_bytes > 0)
+				appendStringInfo(es->str, " fpi bytes=%" PRIu64,
+								 usage->wal_fpi_bytes);
 			if (usage->wal_buffers_full > 0)
 				appendStringInfo(es->str, " buffers full=%" PRId64,
 								 usage->wal_buffers_full);
@@ -4311,6 +4315,8 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 							   usage->wal_fpi, es);
 		ExplainPropertyUInteger("WAL Bytes", NULL,
 								usage->wal_bytes, es);
+		ExplainPropertyUInteger("WAL FPI Bytes", NULL,
+								usage->wal_fpi_bytes, es);
 		ExplainPropertyInteger("WAL Buffers Full", NULL,
 							   usage->wal_buffers_full, es);
 	}
@@ -4901,6 +4907,7 @@ ExplainSubPlans(List *plans, List *ancestors,
 	{
 		SubPlanState *sps = (SubPlanState *) lfirst(lst);
 		SubPlan    *sp = sps->subplan;
+		char	   *cooked_plan_name;
 
 		/*
 		 * There can be multiple SubPlan nodes referencing the same physical
@@ -4924,8 +4931,20 @@ ExplainSubPlans(List *plans, List *ancestors,
 		 */
 		ancestors = lcons(sp, ancestors);
 
+		/*
+		 * The plan has a name like exists_1 or rowcompare_2, but here we want
+		 * to prefix that with CTE, InitPlan, or SubPlan, as appropriate, for
+		 * display purposes.
+		 */
+		if (sp->subLinkType == CTE_SUBLINK)
+			cooked_plan_name = psprintf("CTE %s", sp->plan_name);
+		else if (sp->isInitPlan)
+			cooked_plan_name = psprintf("InitPlan %s", sp->plan_name);
+		else
+			cooked_plan_name = psprintf("SubPlan %s", sp->plan_name);
+
 		ExplainNode(sps->planstate, ancestors,
-					relationship, sp->plan_name, es);
+					relationship, cooked_plan_name, es);
 
 		ancestors = list_delete_first(ancestors);
 	}
@@ -4961,7 +4980,7 @@ ExplainCreateWorkersState(int num_workers)
 {
 	ExplainWorkersState *wstate;
 
-	wstate = (ExplainWorkersState *) palloc(sizeof(ExplainWorkersState));
+	wstate = palloc_object(ExplainWorkersState);
 	wstate->num_workers = num_workers;
 	wstate->worker_inited = (bool *) palloc0(num_workers * sizeof(bool));
 	wstate->worker_str = (StringInfoData *)

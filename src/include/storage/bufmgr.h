@@ -98,8 +98,11 @@ typedef struct SMgrRelationData *SMgrRelation;
 
 /*
  * Some functions identify relations either by relation or smgr +
- * relpersistence.  Used via the BMR_REL()/BMR_SMGR() macros below.  This
- * allows us to use the same function for both recovery and normal operation.
+ * relpersistence, initialized via the BMR_REL()/BMR_SMGR() macros below.
+ * This allows us to use the same function for both recovery and normal
+ * operation.  When BMR_REL is used, it's not valid to cache its rd_smgr here,
+ * because our pointer would be obsolete in case of relcache invalidation.
+ * For simplicity, use BMR_GET_SMGR to read the smgr.
  */
 typedef struct BufferManagerRelation
 {
@@ -108,8 +111,12 @@ typedef struct BufferManagerRelation
 	char		relpersistence;
 } BufferManagerRelation;
 
-#define BMR_REL(p_rel) ((BufferManagerRelation){.rel = p_rel})
-#define BMR_SMGR(p_smgr, p_relpersistence) ((BufferManagerRelation){.smgr = p_smgr, .relpersistence = p_relpersistence})
+#define BMR_REL(p_rel) \
+	((BufferManagerRelation){.rel = p_rel})
+#define BMR_SMGR(p_smgr, p_relpersistence) \
+	((BufferManagerRelation){.smgr = p_smgr, .relpersistence = p_relpersistence})
+#define BMR_GET_SMGR(bmr) \
+	(RelationIsValid((bmr).rel) ? RelationGetSmgr((bmr).rel) : (bmr).smgr)
 
 /* Zero out page if reading fails. */
 #define READ_BUFFERS_ZERO_ON_ERROR (1 << 0)
@@ -193,9 +200,12 @@ extern PGDLLIMPORT int32 *LocalRefCount;
 /*
  * Buffer content lock modes (mode argument for LockBuffer())
  */
-#define BUFFER_LOCK_UNLOCK		0
-#define BUFFER_LOCK_SHARE		1
-#define BUFFER_LOCK_EXCLUSIVE	2
+typedef enum BufferLockMode
+{
+	BUFFER_LOCK_UNLOCK,
+	BUFFER_LOCK_SHARE,
+	BUFFER_LOCK_EXCLUSIVE,
+} BufferLockMode;
 
 
 /*
@@ -230,7 +240,8 @@ extern void WaitReadBuffers(ReadBuffersOperation *operation);
 
 extern void ReleaseBuffer(Buffer buffer);
 extern void UnlockReleaseBuffer(Buffer buffer);
-extern bool BufferIsExclusiveLocked(Buffer buffer);
+extern bool BufferIsLockedByMe(Buffer buffer);
+extern bool BufferIsLockedByMeInMode(Buffer buffer, BufferLockMode mode);
 extern bool BufferIsDirty(Buffer buffer);
 extern void MarkBufferDirty(Buffer buffer);
 extern void IncrBufferRefCount(Buffer buffer);
@@ -291,7 +302,7 @@ extern void BufferGetTag(Buffer buffer, RelFileLocator *rlocator,
 extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 extern void UnlockBuffers(void);
-extern void LockBuffer(Buffer buffer, int mode);
+extern void LockBuffer(Buffer buffer, BufferLockMode mode);
 extern bool ConditionalLockBuffer(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);
@@ -315,6 +326,14 @@ extern void EvictRelUnpinnedBuffers(Relation rel,
 									int32 *buffers_evicted,
 									int32 *buffers_flushed,
 									int32 *buffers_skipped);
+extern bool MarkDirtyUnpinnedBuffer(Buffer buf, bool *buffer_already_dirty);
+extern void MarkDirtyRelUnpinnedBuffers(Relation rel,
+										int32 *buffers_dirtied,
+										int32 *buffers_already_dirty,
+										int32 *buffers_skipped);
+extern void MarkDirtyAllUnpinnedBuffers(int32 *buffers_dirtied,
+										int32 *buffers_already_dirty,
+										int32 *buffers_skipped);
 
 /* in buf_init.c */
 extern void BufferManagerShmemInit(void);

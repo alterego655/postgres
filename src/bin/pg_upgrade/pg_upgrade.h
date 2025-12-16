@@ -115,6 +115,13 @@ extern char *output_files[];
 #define MULTIXACT_FORMATCHANGE_CAT_VER 201301231
 
 /*
+ * MultiXactOffset was changed from 32-bit to 64-bit in version 19, at this
+ * catalog version.  pg_multixact files need to be converted when upgrading
+ * across this version.
+ */
+#define MULTIXACTOFFSET_FORMATCHANGE_CAT_VER 202512091
+
+/*
  * large object chunk size added to pg_controldata,
  * commit 5f93c37805e7485488480916b4585e098d3cc883
  */
@@ -235,7 +242,7 @@ typedef struct
 	uint32		chkpnt_nxtepoch;
 	uint32		chkpnt_nxtoid;
 	uint32		chkpnt_nxtmulti;
-	uint32		chkpnt_nxtmxoff;
+	uint64		chkpnt_nxtmxoff;
 	uint32		chkpnt_oldstMulti;
 	uint32		chkpnt_oldstxid;
 	uint32		align;
@@ -298,7 +305,7 @@ typedef struct
 	char	   *sockdir;		/* directory for Unix Domain socket, if any */
 	unsigned short port;		/* port number where postmaster is waiting */
 	uint32		major_version;	/* PG_VERSION of cluster */
-	char		major_version_str[64];	/* string PG_VERSION of cluster */
+	char	   *major_version_str;	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
 	char	  **tablespaces;	/* tablespace directories */
 	int			num_tablespaces;
@@ -473,7 +480,6 @@ char	   *cluster_conn_opts(ClusterInfo *cluster);
 
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
 void		stop_postmaster(bool in_atexit);
-uint32		get_major_server_version(ClusterInfo *cluster);
 void		check_pghost_envvar(void);
 
 
@@ -499,6 +505,9 @@ void		old_9_6_invalidate_hash_indexes(ClusterInfo *cluster,
 											bool check_mode);
 
 void		report_extension_updates(ClusterInfo *cluster);
+
+/* multixact_rewrite.c */
+MultiXactOffset rewrite_multixacts(MultiXactId from_multi, MultiXactId to_multi);
 
 /* parallel.c */
 void		parallel_exec_prog(const char *log_file, const char *opt_log_file,

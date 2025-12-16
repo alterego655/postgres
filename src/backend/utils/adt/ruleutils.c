@@ -3087,7 +3087,8 @@ pg_get_functiondef(PG_FUNCTION_ARGS)
 				 * string literals.  (The elements may be double-quoted as-is,
 				 * but we can't just feed them to the SQL parser; it would do
 				 * the wrong thing with elements that are zero-length or
-				 * longer than NAMEDATALEN.)
+				 * longer than NAMEDATALEN.)  Also, we need a special case for
+				 * empty lists.
 				 *
 				 * Variables that are not so marked should just be emitted as
 				 * simple string literals.  If the variable is not known to
@@ -3105,6 +3106,9 @@ pg_get_functiondef(PG_FUNCTION_ARGS)
 						/* this shouldn't fail really */
 						elog(ERROR, "invalid list syntax in proconfig item");
 					}
+					/* Special case: represent an empty list as NULL */
+					if (namelist == NIL)
+						appendStringInfoString(&buf, "NULL");
 					foreach(lc, namelist)
 					{
 						char	   *curname = (char *) lfirst(lc);
@@ -3709,7 +3713,7 @@ deparse_context_for(const char *aliasname, Oid relid)
 	deparse_namespace *dpns;
 	RangeTblEntry *rte;
 
-	dpns = (deparse_namespace *) palloc0(sizeof(deparse_namespace));
+	dpns = palloc0_object(deparse_namespace);
 
 	/* Build a minimal RTE for the rel */
 	rte = makeNode(RangeTblEntry);
@@ -3753,7 +3757,7 @@ deparse_context_for_plan_tree(PlannedStmt *pstmt, List *rtable_names)
 {
 	deparse_namespace *dpns;
 
-	dpns = (deparse_namespace *) palloc0(sizeof(deparse_namespace));
+	dpns = palloc0_object(deparse_namespace);
 
 	/* Initialize fields that stay the same across the whole plan tree */
 	dpns->rtable = pstmt->rtable;
@@ -6186,7 +6190,9 @@ get_basic_select_query(Query *query, deparse_context *context)
 		save_ingroupby = context->inGroupBy;
 		context->inGroupBy = true;
 
-		if (query->groupingSets == NIL)
+		if (query->groupByAll)
+			appendStringInfoString(buf, "ALL");
+		else if (query->groupingSets == NIL)
 		{
 			sep = "";
 			foreach(l, query->groupClause)
@@ -8749,8 +8755,16 @@ get_parameter(Param *param, deparse_context *context)
 	subplan = find_param_generator(param, context, &column);
 	if (subplan)
 	{
-		appendStringInfo(context->buf, "(%s%s).col%d",
+		const char *nameprefix;
+
+		if (subplan->isInitPlan)
+			nameprefix = "InitPlan ";
+		else
+			nameprefix = "SubPlan ";
+
+		appendStringInfo(context->buf, "(%s%s%s).col%d",
 						 subplan->useHashTable ? "hashed " : "",
+						 nameprefix,
 						 subplan->plan_name, column + 1);
 
 		return;
@@ -9587,11 +9601,19 @@ get_rule_expr(Node *node, deparse_context *context,
 				}
 				else
 				{
+					const char *nameprefix;
+
 					/* No referencing Params, so show the SubPlan's name */
-					if (subplan->useHashTable)
-						appendStringInfo(buf, "hashed %s)", subplan->plan_name);
+					if (subplan->isInitPlan)
+						nameprefix = "InitPlan ";
 					else
-						appendStringInfo(buf, "%s)", subplan->plan_name);
+						nameprefix = "SubPlan ";
+					if (subplan->useHashTable)
+						appendStringInfo(buf, "hashed %s%s)",
+										 nameprefix, subplan->plan_name);
+					else
+						appendStringInfo(buf, "%s%s)",
+										 nameprefix, subplan->plan_name);
 				}
 			}
 			break;
@@ -9611,11 +9633,18 @@ get_rule_expr(Node *node, deparse_context *context,
 				foreach(lc, asplan->subplans)
 				{
 					SubPlan    *splan = lfirst_node(SubPlan, lc);
+					const char *nameprefix;
 
-					if (splan->useHashTable)
-						appendStringInfo(buf, "hashed %s", splan->plan_name);
+					if (splan->isInitPlan)
+						nameprefix = "InitPlan ";
 					else
-						appendStringInfoString(buf, splan->plan_name);
+						nameprefix = "SubPlan ";
+					if (splan->useHashTable)
+						appendStringInfo(buf, "hashed %s%s", nameprefix,
+										 splan->plan_name);
+					else
+						appendStringInfo(buf, "%s%s", nameprefix,
+										 splan->plan_name);
 					if (lnext(asplan->subplans, lc))
 						appendStringInfoString(buf, " or ");
 				}
@@ -9910,7 +9939,7 @@ get_rule_expr(Node *node, deparse_context *context,
 					Node	   *e = (Node *) lfirst(arg);
 
 					if (tupdesc == NULL ||
-						!TupleDescAttr(tupdesc, i)->attisdropped)
+						!TupleDescCompactAttr(tupdesc, i)->attisdropped)
 					{
 						appendStringInfoString(buf, sep);
 						/* Whole-row Vars need special treatment here */
@@ -9923,7 +9952,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				{
 					while (i < tupdesc->natts)
 					{
-						if (!TupleDescAttr(tupdesc, i)->attisdropped)
+						if (!TupleDescCompactAttr(tupdesc, i)->attisdropped)
 						{
 							appendStringInfoString(buf, sep);
 							appendStringInfoString(buf, "NULL");
@@ -10122,7 +10151,7 @@ get_rule_expr(Node *node, deparse_context *context,
 
 						if (needcomma)
 							appendStringInfoString(buf, ", ");
-						get_rule_expr((Node *) e, context, true);
+						get_rule_expr(e, context, true);
 						appendStringInfo(buf, " AS %s",
 										 quote_identifier(map_xml_name_to_sql_identifier(argname)));
 						needcomma = true;
@@ -11089,7 +11118,12 @@ get_windowfunc_expr_helper(WindowFunc *wfunc, deparse_context *context,
 		get_rule_expr((Node *) wfunc->aggfilter, context, false);
 	}
 
-	appendStringInfoString(buf, ") OVER ");
+	appendStringInfoString(buf, ") ");
+
+	if (wfunc->ignore_nulls == PARSER_IGNORE_NULLS)
+		appendStringInfoString(buf, "IGNORE NULLS ");
+
+	appendStringInfoString(buf, "OVER ");
 
 	if (context->windowClause)
 	{
@@ -13677,25 +13711,26 @@ char *
 get_range_partbound_string(List *bound_datums)
 {
 	deparse_context context;
-	StringInfo	buf = makeStringInfo();
+	StringInfoData buf;
 	ListCell   *cell;
 	char	   *sep;
 
+	initStringInfo(&buf);
 	memset(&context, 0, sizeof(deparse_context));
-	context.buf = buf;
+	context.buf = &buf;
 
-	appendStringInfoChar(buf, '(');
+	appendStringInfoChar(&buf, '(');
 	sep = "";
 	foreach(cell, bound_datums)
 	{
 		PartitionRangeDatum *datum =
 			lfirst_node(PartitionRangeDatum, cell);
 
-		appendStringInfoString(buf, sep);
+		appendStringInfoString(&buf, sep);
 		if (datum->kind == PARTITION_RANGE_DATUM_MINVALUE)
-			appendStringInfoString(buf, "MINVALUE");
+			appendStringInfoString(&buf, "MINVALUE");
 		else if (datum->kind == PARTITION_RANGE_DATUM_MAXVALUE)
-			appendStringInfoString(buf, "MAXVALUE");
+			appendStringInfoString(&buf, "MAXVALUE");
 		else
 		{
 			Const	   *val = castNode(Const, datum->value);
@@ -13704,7 +13739,7 @@ get_range_partbound_string(List *bound_datums)
 		}
 		sep = ", ";
 	}
-	appendStringInfoChar(buf, ')');
+	appendStringInfoChar(&buf, ')');
 
-	return buf->data;
+	return buf.data;
 }

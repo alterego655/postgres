@@ -489,7 +489,7 @@ restartScanEntry:
 static int
 entryIndexByFrequencyCmp(const void *a1, const void *a2, void *arg)
 {
-	const GinScanKey key = (const GinScanKey) arg;
+	const GinScanKeyData *key = arg;
 	int			i1 = *(const int *) a1;
 	int			i2 = *(const int *) a2;
 	uint32		n1 = key->scanEntry[i1]->predictNumberResult;
@@ -552,7 +552,7 @@ startScanKey(GinState *ginstate, GinScanOpaque so, GinScanKey key)
 	{
 		MemoryContextSwitchTo(so->tempCtx);
 
-		entryIndexes = (int *) palloc(sizeof(int) * key->nentries);
+		entryIndexes = palloc_array(int, key->nentries);
 		for (i = 0; i < key->nentries; i++)
 			entryIndexes[i] = i;
 		qsort_arg(entryIndexes, key->nentries, sizeof(int),
@@ -1873,7 +1873,7 @@ scanPendingInsert(IndexScanDesc scan, TIDBitmap *tbm, int64 *ntids)
 	LockBuffer(pos.pendingBuffer, GIN_SHARE);
 	pos.firstOffset = FirstOffsetNumber;
 	UnlockReleaseBuffer(metabuffer);
-	pos.hasMatchKey = palloc(sizeof(bool) * so->nkeys);
+	pos.hasMatchKey = palloc_array(bool, so->nkeys);
 
 	/*
 	 * loop for each heap row. scanGetCandidate returns full row or row's

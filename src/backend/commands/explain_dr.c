@@ -19,6 +19,7 @@
 #include "libpq/pqformat.h"
 #include "libpq/protocol.h"
 #include "utils/lsyscache.h"
+#include "varatt.h"
 
 /*
  * DestReceiver functions for SERIALIZE option
@@ -275,7 +276,7 @@ CreateExplainSerializeDestReceiver(ExplainState *es)
 {
 	SerializeDestReceiver *self;
 
-	self = (SerializeDestReceiver *) palloc0(sizeof(SerializeDestReceiver));
+	self = palloc0_object(SerializeDestReceiver);
 
 	self->pub.receiveSlot = serializeAnalyzeReceive;
 	self->pub.rStartup = serializeAnalyzeStartup;

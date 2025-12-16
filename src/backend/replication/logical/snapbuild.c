@@ -152,6 +152,10 @@ static ResourceOwner SavedResourceOwnerDuringExport = NULL;
 static bool ExportInProgress = false;
 
 /* ->committed and ->catchange manipulation */
+static int	xid_bsearch_lower_bound(const TransactionId *xip, int n,
+									TransactionId key);
+static int	xid_purge_with_boundary(TransactionId *xip, int xcnt,
+									TransactionId boundary, TransactionId xmin);
 static void SnapBuildPurgeOlderTxn(SnapBuild *builder);
 
 /* snapshot building/manipulation/distribution functions */
@@ -199,7 +203,7 @@ AllocateSnapshotBuilder(ReorderBuffer *reorder,
 									ALLOCSET_DEFAULT_SIZES);
 	oldcontext = MemoryContextSwitchTo(context);
 
-	builder = palloc0(sizeof(SnapBuild));
+	builder = palloc0_object(SnapBuild);
 
 	builder->state = SNAPBUILD_START;
 	builder->context = context;
@@ -407,8 +411,11 @@ SnapBuildBuildSnapshot(SnapBuild *builder)
 		   builder->committed.xip,
 		   builder->committed.xcnt * sizeof(TransactionId));
 
-	/* sort so we can bsearch() */
-	qsort(snapshot->xip, snapshot->xcnt, sizeof(TransactionId), xidComparator);
+#ifdef USE_ASSERT_CHECKING
+	/* Verify array is strictly sorted (no duplicates allowed) */
+	for (int i = 1; i < snapshot->xcnt; i++)
+		Assert(snapshot->xip[i - 1] < snapshot->xip[i]);
+#endif
 
 	/*
 	 * Initially, subxip is empty, i.e. it's a snapshot to be used by
@@ -486,8 +493,7 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
 	MyProc->xmin = snap->xmin;
 
 	/* allocate in transaction context */
-	newxip = (TransactionId *)
-		palloc(sizeof(TransactionId) * GetMaxSnapshotXidCount());
+	newxip = palloc_array(TransactionId, GetMaxSnapshotXidCount());
 
 	/*
 	 * snapbuild.c builds transactions in an "inverted" manner, which means it
@@ -823,16 +829,32 @@ SnapBuildDistributeSnapshotAndInval(SnapBuild *builder, XLogRecPtr lsn, Transact
 }
 
 /*
- * Keep track of a new catalog changing transaction that has committed.
+ * Keep track of new catalog changing transactions that have committed.
+ *
+ * Before reaching CONSISTENT state, we use fast O(1) append since the array
+ * doesn't need to be sorted yet.  After CONSISTENT, we maintain sorted order
+ * using a merge approach to avoid repeated full-array sorts at snapshot build.
  */
 static void
-SnapBuildAddCommittedTxn(SnapBuild *builder, TransactionId xid)
+SnapBuildAddCommittedTxns(SnapBuild *builder,
+						  const TransactionId *batch_xids,
+						  int batch_cnt)
 {
-	Assert(TransactionIdIsValid(xid));
+	TransactionId *committed_xids;
+	size_t		old_xcnt;
 
-	if (builder->committed.xcnt == builder->committed.xcnt_space)
+	old_xcnt = builder->committed.xcnt;
+
+	/* Ensure we have space for all elements */
+	if (old_xcnt + batch_cnt > builder->committed.xcnt_space)
 	{
 		builder->committed.xcnt_space = builder->committed.xcnt_space * 2 + 1;
+
+		/*
+		 * Repeat if we need more than 2x current space.
+		 */
+		while (old_xcnt + batch_cnt > builder->committed.xcnt_space)
+			builder->committed.xcnt_space = builder->committed.xcnt_space * 2 + 1;
 
 		elog(DEBUG1, "increasing space for committed transactions to %u",
 			 (uint32) builder->committed.xcnt_space);
@@ -841,12 +863,155 @@ SnapBuildAddCommittedTxn(SnapBuild *builder, TransactionId xid)
 										  builder->committed.xcnt_space * sizeof(TransactionId));
 	}
 
+	committed_xids = builder->committed.xip;
+
 	/*
-	 * TODO: It might make sense to keep the array sorted here instead of
-	 * doing it every time we build a new snapshot. On the other hand this
-	 * gets called repeatedly when a transaction with subtransactions commits.
+	 * Before CONSISTENT state, just append unsorted for O(1) performance. The
+	 * array will be sorted once when transitioning to CONSISTENT.
 	 */
-	builder->committed.xip[builder->committed.xcnt++] = xid;
+	if (builder->state < SNAPBUILD_CONSISTENT)
+	{
+		for (int i = 0; i < batch_cnt; i++)
+		{
+			Assert(TransactionIdIsValid(batch_xids[i]));
+			committed_xids[old_xcnt++] = batch_xids[i];
+		}
+		builder->committed.xcnt = old_xcnt;
+	}
+	else
+	{
+		/*
+		 * After CONSISTENT, maintain sorted order via merge.  Merge from the
+		 * end to avoid overwriting unread data.
+		 */
+		int			old_idx = old_xcnt - 1;
+		int			batch_idx = batch_cnt - 1;
+		int			write_idx = old_xcnt + batch_cnt - 1;
+
+		while (old_idx >= 0 && batch_idx >= 0)
+		{
+			Assert(TransactionIdIsValid(batch_xids[batch_idx]));
+
+			if (committed_xids[old_idx] > batch_xids[batch_idx])
+			{
+				committed_xids[write_idx--] = committed_xids[old_idx--];
+			}
+			else
+			{
+				/* Duplicates should never occur */
+				Assert(committed_xids[old_idx] != batch_xids[batch_idx]);
+				committed_xids[write_idx--] = batch_xids[batch_idx--];
+			}
+		}
+
+		/* Copy any remaining batch elements */
+		while (batch_idx >= 0)
+		{
+			Assert(TransactionIdIsValid(batch_xids[batch_idx]));
+			committed_xids[write_idx--] = batch_xids[batch_idx--];
+		}
+
+		/* Old elements that weren't moved are already in correct position */
+		builder->committed.xcnt = old_xcnt + batch_cnt;
+	}
+}
+
+/*
+ * Binary search helper: find the first index where xip[i] >= key.
+ * Returns n if all elements are less than key.
+ *
+ * This is a standard lower_bound operation using unsigned comparison to match
+ * xidComparator ordering.
+ */
+static int
+xid_bsearch_lower_bound(const TransactionId *xip, int n, TransactionId key)
+{
+	int			lo = 0;
+	int			hi = n;
+
+	while (lo < hi)
+	{
+		int			mid = (lo + hi) >> 1;
+
+		if (xip[mid] < key)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/*
+ * Remove XIDs in the modular interval [boundary, xmin) from a sorted array.
+ *
+ * The array must be sorted in numeric uint32 order. XIDs in [boundary, xmin)
+ * are those that satisfy NormalTransactionIdPrecedes(xid, xmin).
+ *
+ * Returns the new count after removal. The array is compacted in-place.
+ */
+static int
+xid_purge_with_boundary(TransactionId *xip, int xcnt,
+						TransactionId boundary, TransactionId xmin)
+{
+	int			idx_boundary;
+	int			idx_xmin;
+	int			new_xcnt;
+
+	if (xcnt == 0)
+		return 0;
+
+	/*
+	 * Find where [boundary, xmin) appears in the numeric-sorted array.
+	 * idx_boundary = first index with xip[i] >= boundary idx_xmin     = first
+	 * index with xip[i] >= xmin
+	 */
+	idx_boundary = xid_bsearch_lower_bound(xip, xcnt, boundary);
+	idx_xmin = xid_bsearch_lower_bound(xip, xcnt, xmin);
+
+	/*
+	 * Case split based on numeric comparison (array is uint32-sorted):
+	 *
+	 * Case A: boundary <= xmin numerically Interval forms one block:
+	 * [idx_boundary, idx_xmin) Keep: [0, idx_boundary) and [idx_xmin, n)
+	 *
+	 * Case B: boundary > xmin numerically Interval straddles numeric zero as
+	 * two blocks: [0, idx_xmin) and [idx_boundary, n) Keep: [idx_xmin,
+	 * idx_boundary)
+	 *
+	 * Note: Case B occurs due to ring geometry when the modular interval
+	 * crosses zero in numeric order, not because XIDs have "wrapped"
+	 * operationally.
+	 */
+	if (boundary <= xmin)
+	{
+		/* Case A: interval is contiguous, keep prefix and suffix */
+		int			prefix_len = idx_boundary;
+		int			suffix_len = xcnt - idx_xmin;
+
+		if (suffix_len > 0 && idx_xmin > idx_boundary)
+			memmove(xip + prefix_len,
+					xip + idx_xmin,
+					suffix_len * sizeof(TransactionId));
+
+		new_xcnt = prefix_len + suffix_len;
+	}
+	else
+	{
+		/* Case B: interval straddles zero, keep middle block */
+		int			keep_len;
+
+		Assert(idx_boundary >= idx_xmin);
+		keep_len = idx_boundary - idx_xmin;
+
+		if (keep_len > 0 && idx_xmin > 0)
+			memmove(xip,
+					xip + idx_xmin,
+					keep_len * sizeof(TransactionId));
+
+		new_xcnt = keep_len;
+	}
+
+	return new_xcnt;
 }
 
 /*
@@ -862,74 +1027,84 @@ SnapBuildAddCommittedTxn(SnapBuild *builder, TransactionId xid)
 static void
 SnapBuildPurgeOlderTxn(SnapBuild *builder)
 {
-	int			off;
-	TransactionId *workspace;
-	int			surviving_xids = 0;
+	TransactionId boundary;
 
 	/* not ready yet */
 	if (!TransactionIdIsNormal(builder->xmin))
 		return;
 
-	/* TODO: Neater algorithm than just copying and iterating? */
-	workspace =
-		MemoryContextAlloc(builder->context,
-						   builder->committed.xcnt * sizeof(TransactionId));
+	/*
+	 * Compute the boundary for the "old" interval [boundary, xmin). XIDs in
+	 * this interval satisfy NormalTransactionIdPrecedes(xid, xmin).
+	 */
+	boundary = builder->xmin - 0x80000000U;
 
-	/* copy xids that still are interesting to workspace */
-	for (off = 0; off < builder->committed.xcnt; off++)
+	/* Purge committed.xip */
+	if (builder->committed.xcnt > 0)
 	{
-		if (NormalTransactionIdPrecedes(builder->committed.xip[off],
-										builder->xmin))
-			;					/* remove */
+		int			old_xcnt = builder->committed.xcnt;
+
+		if (builder->state < SNAPBUILD_CONSISTENT)
+		{
+			/*
+			 * Pre-CONSISTENT: array is unsorted, use in-place compaction
+			 * O(n).
+			 */
+			int			off;
+			int			surviving_xids = 0;
+
+			for (off = 0; off < builder->committed.xcnt; off++)
+			{
+				if (!NormalTransactionIdPrecedes(builder->committed.xip[off],
+												 builder->xmin))
+					builder->committed.xip[surviving_xids++] =
+						builder->committed.xip[off];
+			}
+			builder->committed.xcnt = surviving_xids;
+		}
 		else
-			workspace[surviving_xids++] = builder->committed.xip[off];
+		{
+			/*
+			 * Post-CONSISTENT: array is sorted, use binary search O(log n).
+			 */
+#ifdef USE_ASSERT_CHECKING
+			for (int i = 1; i < old_xcnt; i++)
+				Assert(builder->committed.xip[i - 1] < builder->committed.xip[i]);
+#endif
+			builder->committed.xcnt =
+				xid_purge_with_boundary(builder->committed.xip,
+										old_xcnt, boundary, builder->xmin);
+		}
+
+		elog(DEBUG3, "purged committed transactions from %u to %u, xmin: %u, xmax: %u",
+			 (uint32) old_xcnt, (uint32) builder->committed.xcnt,
+			 builder->xmin, builder->xmax);
 	}
 
-	/* copy workspace back to persistent state */
-	memcpy(builder->committed.xip, workspace,
-		   surviving_xids * sizeof(TransactionId));
-
-	elog(DEBUG3, "purged committed transactions from %u to %u, xmin: %u, xmax: %u",
-		 (uint32) builder->committed.xcnt, (uint32) surviving_xids,
-		 builder->xmin, builder->xmax);
-	builder->committed.xcnt = surviving_xids;
-
-	pfree(workspace);
-
 	/*
-	 * Purge xids in ->catchange as well. The purged array must also be sorted
-	 * in xidComparator order.
+	 * Purge catchange.xip using binary search. This array is always sorted.
 	 */
 	if (builder->catchange.xcnt > 0)
 	{
-		/*
-		 * Since catchange.xip is sorted, we find the lower bound of xids that
-		 * are still interesting.
-		 */
-		for (off = 0; off < builder->catchange.xcnt; off++)
-		{
-			if (TransactionIdFollowsOrEquals(builder->catchange.xip[off],
-											 builder->xmin))
-				break;
-		}
+		int			old_xcnt = builder->catchange.xcnt;
 
-		surviving_xids = builder->catchange.xcnt - off;
+#ifdef USE_ASSERT_CHECKING
+		for (int i = 1; i < old_xcnt; i++)
+			Assert(builder->catchange.xip[i - 1] < builder->catchange.xip[i]);
+#endif
+		builder->catchange.xcnt =
+			xid_purge_with_boundary(builder->catchange.xip,
+									old_xcnt, boundary, builder->xmin);
 
-		if (surviving_xids > 0)
-		{
-			memmove(builder->catchange.xip, &(builder->catchange.xip[off]),
-					surviving_xids * sizeof(TransactionId));
-		}
-		else
+		if (builder->catchange.xcnt == 0)
 		{
 			pfree(builder->catchange.xip);
 			builder->catchange.xip = NULL;
 		}
 
 		elog(DEBUG3, "purged catalog modifying transactions from %u to %u, xmin: %u, xmax: %u",
-			 (uint32) builder->catchange.xcnt, (uint32) surviving_xids,
+			 (uint32) old_xcnt, (uint32) builder->catchange.xcnt,
 			 builder->xmin, builder->xmax);
-		builder->catchange.xcnt = surviving_xids;
 	}
 }
 
@@ -947,6 +1122,13 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 	bool		sub_needs_timetravel = false;
 
 	TransactionId xmax = xid;
+
+	/*
+	 * Collect XIDs that need tracking into a batch.  We'll sort and merge
+	 * them into committed.xip in one pass at the end.
+	 */
+	TransactionId *batch_xids = NULL;
+	int			batch_cnt = 0;
 
 	/*
 	 * Transactions preceding BUILDING_SNAPSHOT will neither be decoded, nor
@@ -978,6 +1160,12 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 		}
 	}
 
+	if (nsubxacts > 0 || builder->building_full_snapshot ||
+		SnapBuildXidHasCatalogChanges(builder, xid, xinfo))
+	{
+		batch_xids = palloc((nsubxacts + 1) * sizeof(TransactionId));
+	}
+
 	for (nxact = 0; nxact < nsubxacts; nxact++)
 	{
 		TransactionId subxid = subxacts[nxact];
@@ -994,7 +1182,7 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 			elog(DEBUG1, "found subtransaction %u:%u with catalog changes",
 				 xid, subxid);
 
-			SnapBuildAddCommittedTxn(builder, subxid);
+			batch_xids[batch_cnt++] = subxid;
 
 			if (NormalTransactionIdFollows(subxid, xmax))
 				xmax = subxid;
@@ -1008,7 +1196,7 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 		 */
 		else if (needs_timetravel)
 		{
-			SnapBuildAddCommittedTxn(builder, subxid);
+			batch_xids[batch_cnt++] = subxid;
 			if (NormalTransactionIdFollows(subxid, xmax))
 				xmax = subxid;
 		}
@@ -1021,7 +1209,7 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 			 xid);
 		needs_snapshot = true;
 		needs_timetravel = true;
-		SnapBuildAddCommittedTxn(builder, xid);
+		batch_xids[batch_cnt++] = xid;
 	}
 	else if (sub_needs_timetravel)
 	{
@@ -1029,14 +1217,32 @@ SnapBuildCommitTxn(SnapBuild *builder, XLogRecPtr lsn, TransactionId xid,
 		elog(DEBUG2, "forced transaction %u to do timetravel due to one of its subtransactions",
 			 xid);
 		needs_timetravel = true;
-		SnapBuildAddCommittedTxn(builder, xid);
+		batch_xids[batch_cnt++] = xid;
 	}
 	else if (needs_timetravel)
 	{
 		elog(DEBUG2, "forced transaction %u to do timetravel", xid);
 
-		SnapBuildAddCommittedTxn(builder, xid);
+		batch_xids[batch_cnt++] = xid;
 	}
+
+	/*
+	 * Sort and merge the batch into committed.xip.  This maintains the
+	 * invariant that committed.xip is globally sorted by raw uint32 order
+	 * (xidComparator).
+	 */
+	if (batch_cnt > 0)
+	{
+		/* Sort by raw uint32 order */
+		qsort(batch_xids, batch_cnt, sizeof(TransactionId), xidComparator);
+
+		/* Merge into global array */
+		SnapBuildAddCommittedTxns(builder, batch_xids, batch_cnt);
+	}
+
+	/* Free batch array if allocated (even if nothing was added to it) */
+	if (batch_xids != NULL)
+		pfree(batch_xids);
 
 	if (!needs_timetravel)
 	{
@@ -1210,7 +1416,7 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	 * oldest ongoing txn might have started when we didn't yet serialize
 	 * anything because we hadn't reached a consistent state yet.
 	 */
-	if (txn != NULL && txn->restart_decoding_lsn != InvalidXLogRecPtr)
+	if (txn != NULL && XLogRecPtrIsValid(txn->restart_decoding_lsn))
 		LogicalIncreaseRestartDecodingForSlot(lsn, txn->restart_decoding_lsn);
 
 	/*
@@ -1218,8 +1424,8 @@ SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn, xl_running_xact
 	 * we have one.
 	 */
 	else if (txn == NULL &&
-			 builder->reorder->current_restart_decoding_lsn != InvalidXLogRecPtr &&
-			 builder->last_serialized_snapshot != InvalidXLogRecPtr)
+			 XLogRecPtrIsValid(builder->reorder->current_restart_decoding_lsn) &&
+			 XLogRecPtrIsValid(builder->last_serialized_snapshot))
 		LogicalIncreaseRestartDecodingForSlot(lsn,
 											  builder->last_serialized_snapshot);
 }
@@ -1293,7 +1499,7 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 	 */
 	if (running->oldestRunningXid == running->nextXid)
 	{
-		if (builder->start_decoding_at == InvalidXLogRecPtr ||
+		if (!XLogRecPtrIsValid(builder->start_decoding_at) ||
 			builder->start_decoding_at <= lsn)
 			/* can decode everything after this */
 			builder->start_decoding_at = lsn + 1;
@@ -1305,6 +1511,15 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 		/* so we can safely use the faster comparisons */
 		Assert(TransactionIdIsNormal(builder->xmin));
 		Assert(TransactionIdIsNormal(builder->xmax));
+
+		/*
+		 * Sort committed.xip before transitioning to CONSISTENT.  During the
+		 * pre-CONSISTENT phase, XIDs were appended unsorted for performance.
+		 * Now we need sorted order for efficient snapshot building.
+		 */
+		if (builder->committed.xcnt > 1)
+			qsort(builder->committed.xip, builder->committed.xcnt,
+				  sizeof(TransactionId), xidComparator);
 
 		builder->state = SNAPBUILD_CONSISTENT;
 		builder->next_phase_at = InvalidTransactionId;
@@ -1403,6 +1618,15 @@ SnapBuildFindSnapshot(SnapBuild *builder, XLogRecPtr lsn, xl_running_xacts *runn
 			 TransactionIdPrecedesOrEquals(builder->next_phase_at,
 										   running->oldestRunningXid))
 	{
+		/*
+		 * Sort committed.xip before transitioning to CONSISTENT.  During the
+		 * pre-CONSISTENT phase, XIDs were appended unsorted for performance.
+		 * Now we need sorted order for efficient snapshot building.
+		 */
+		if (builder->committed.xcnt > 1)
+			qsort(builder->committed.xip, builder->committed.xcnt,
+				  sizeof(TransactionId), xidComparator);
+
 		builder->state = SNAPBUILD_CONSISTENT;
 		builder->next_phase_at = InvalidTransactionId;
 
@@ -1509,8 +1733,8 @@ SnapBuildSerialize(SnapBuild *builder, XLogRecPtr lsn)
 	struct stat stat_buf;
 	Size		sz;
 
-	Assert(lsn != InvalidXLogRecPtr);
-	Assert(builder->last_serialized_snapshot == InvalidXLogRecPtr ||
+	Assert(XLogRecPtrIsValid(lsn));
+	Assert(!XLogRecPtrIsValid(builder->last_serialized_snapshot) ||
 		   builder->last_serialized_snapshot <= lsn);
 
 	/*
@@ -1890,6 +2114,13 @@ SnapBuildRestore(SnapBuild *builder, XLogRecPtr lsn)
 		pfree(builder->committed.xip);
 		builder->committed.xcnt_space = ondisk.builder.committed.xcnt;
 		builder->committed.xip = ondisk.builder.committed.xip;
+
+		/*
+		 * Sort the restored array to ensure it's in xidComparator order. Old
+		 * snapshot files may have been written with unsorted arrays.
+		 */
+		qsort(builder->committed.xip, builder->committed.xcnt,
+			  sizeof(TransactionId), xidComparator);
 	}
 	ondisk.builder.committed.xip = NULL;
 
@@ -2029,7 +2260,7 @@ CheckPointSnapBuild(void)
 		lsn = ((uint64) hi) << 32 | lo;
 
 		/* check whether we still need it */
-		if (lsn < cutoff || cutoff == InvalidXLogRecPtr)
+		if (lsn < cutoff || !XLogRecPtrIsValid(cutoff))
 		{
 			elog(DEBUG1, "removing snapbuild snapshot %s", path);
 

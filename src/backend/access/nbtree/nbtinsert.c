@@ -26,6 +26,7 @@
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
+#include "utils/injection_point.h"
 
 /* Minimum tree height for application of fastpath optimization */
 #define BTREE_FASTPATH_MIN_LEVEL	2
@@ -61,7 +62,7 @@ static Buffer _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key,
 static void _bt_insert_parent(Relation rel, Relation heaprel, Buffer buf,
 							  Buffer rbuf, BTStack stack, bool isroot, bool isonly);
 static Buffer _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf);
-static inline bool _bt_pgaddtup(Page page, Size itemsize, IndexTuple itup,
+static inline bool _bt_pgaddtup(Page page, Size itemsize, const IndexTupleData *itup,
 								OffsetNumber itup_off, bool newfirstdataitem);
 static void _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 										 BTInsertState insertstate,
@@ -1239,6 +1240,13 @@ _bt_insertonpg(Relation rel,
 		 * page.
 		 *----------
 		 */
+#ifdef USE_INJECTION_POINTS
+		if (P_ISLEAF(opaque))
+			INJECTION_POINT("nbtree-leave-leaf-split-incomplete", NULL);
+		else
+			INJECTION_POINT("nbtree-leave-internal-split-incomplete", NULL);
+#endif
+
 		_bt_insert_parent(rel, heaprel, buf, rbuf, stack, isroot, isonly);
 	}
 	else
@@ -1278,8 +1286,7 @@ _bt_insertonpg(Relation rel,
 		if (postingoff != 0)
 			memcpy(oposting, nposting, MAXALIGN(IndexTupleSize(nposting)));
 
-		if (PageAddItem(page, (Item) itup, itemsz, newitemoff, false,
-						false) == InvalidOffsetNumber)
+		if (PageAddItem(page, itup, itemsz, newitemoff, false, false) == InvalidOffsetNumber)
 			elog(PANIC, "failed to add new item to block %u in index \"%s\"",
 				 BufferGetBlockNumber(buf), RelationGetRelationName(rel));
 
@@ -1700,8 +1707,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	Assert(BTreeTupleGetNAtts(lefthighkey, rel) <=
 		   IndexRelationGetNumberOfKeyAttributes(rel));
 	Assert(itemsz == MAXALIGN(IndexTupleSize(lefthighkey)));
-	if (PageAddItem(leftpage, (Item) lefthighkey, itemsz, afterleftoff, false,
-					false) == InvalidOffsetNumber)
+	if (PageAddItem(leftpage, lefthighkey, itemsz, afterleftoff, false, false) == InvalidOffsetNumber)
 		elog(ERROR, "failed to add high key to the left sibling"
 			 " while splitting block %u of index \"%s\"",
 			 origpagenumber, RelationGetRelationName(rel));
@@ -1771,8 +1777,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 		Assert(BTreeTupleGetNAtts(righthighkey, rel) > 0);
 		Assert(BTreeTupleGetNAtts(righthighkey, rel) <=
 			   IndexRelationGetNumberOfKeyAttributes(rel));
-		if (PageAddItem(rightpage, (Item) righthighkey, itemsz, afterrightoff,
-						false, false) == InvalidOffsetNumber)
+		if (PageAddItem(rightpage, righthighkey, itemsz, afterrightoff, false, false) == InvalidOffsetNumber)
 		{
 			elog(ERROR, "failed to add high key to the right sibling"
 				 " while splitting block %u of index \"%s\"",
@@ -2288,6 +2293,7 @@ _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack)
 	/* Was this the only page on the level before split? */
 	wasonly = (P_LEFTMOST(lpageop) && P_RIGHTMOST(rpageop));
 
+	INJECTION_POINT("nbtree-finish-incomplete-split", NULL);
 	elog(DEBUG1, "finishing incomplete split of %u/%u",
 		 BufferGetBlockNumber(lbuf), BufferGetBlockNumber(rbuf));
 
@@ -2537,8 +2543,7 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
 	 * benefit of _bt_restore_page().
 	 */
 	Assert(BTreeTupleGetNAtts(left_item, rel) == 0);
-	if (PageAddItem(rootpage, (Item) left_item, left_item_sz, P_HIKEY,
-					false, false) == InvalidOffsetNumber)
+	if (PageAddItem(rootpage, left_item, left_item_sz, P_HIKEY, false, false) == InvalidOffsetNumber)
 		elog(PANIC, "failed to add leftkey to new root page"
 			 " while splitting block %u of index \"%s\"",
 			 BufferGetBlockNumber(lbuf), RelationGetRelationName(rel));
@@ -2549,8 +2554,7 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
 	Assert(BTreeTupleGetNAtts(right_item, rel) > 0);
 	Assert(BTreeTupleGetNAtts(right_item, rel) <=
 		   IndexRelationGetNumberOfKeyAttributes(rel));
-	if (PageAddItem(rootpage, (Item) right_item, right_item_sz, P_FIRSTKEY,
-					false, false) == InvalidOffsetNumber)
+	if (PageAddItem(rootpage, right_item, right_item_sz, P_FIRSTKEY, false, false) == InvalidOffsetNumber)
 		elog(PANIC, "failed to add rightkey to new root page"
 			 " while splitting block %u of index \"%s\"",
 			 BufferGetBlockNumber(lbuf), RelationGetRelationName(rel));
@@ -2639,7 +2643,7 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
 static inline bool
 _bt_pgaddtup(Page page,
 			 Size itemsize,
-			 IndexTuple itup,
+			 const IndexTupleData *itup,
 			 OffsetNumber itup_off,
 			 bool newfirstdataitem)
 {
@@ -2654,8 +2658,7 @@ _bt_pgaddtup(Page page,
 		itemsize = sizeof(IndexTupleData);
 	}
 
-	if (unlikely(PageAddItem(page, (Item) itup, itemsize, itup_off, false,
-							 false) == InvalidOffsetNumber))
+	if (unlikely(PageAddItem(page, itup, itemsize, itup_off, false, false) == InvalidOffsetNumber))
 		return false;
 
 	return true;
@@ -2960,7 +2963,7 @@ _bt_deadblocks(Page page, OffsetNumber *deletable, int ndeletable,
 	 */
 	spacentids = ndeletable + 1;
 	ntids = 0;
-	tidblocks = (BlockNumber *) palloc(sizeof(BlockNumber) * spacentids);
+	tidblocks = palloc_array(BlockNumber, spacentids);
 
 	/*
 	 * First add the table block for the incoming newitem.  This is the one

@@ -244,8 +244,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	pg_log_info("reading subscriptions");
 	getSubscriptions(fout);
 
-	pg_log_info("reading subscription membership of tables");
-	getSubscriptionTables(fout);
+	pg_log_info("reading subscription membership of relations");
+	getSubscriptionRelations(fout);
 
 	free(inhinfo);				/* not needed any longer */
 
@@ -353,7 +353,7 @@ flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 						 tblinfo[i].numParents,
 						 tblinfo[i].dobj.name);
 
-			attachinfo = (TableAttachInfo *) palloc(sizeof(TableAttachInfo));
+			attachinfo = palloc_object(TableAttachInfo);
 			attachinfo->dobj.objType = DO_TABLE_ATTACH;
 			attachinfo->dobj.catId.tableoid = 0;
 			attachinfo->dobj.catId.oid = 0;

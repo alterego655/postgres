@@ -19,8 +19,10 @@
 
 #include "access/heapam.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "statistics/statistics.h"
 #include "statistics/stat_utils.h"
@@ -33,6 +35,11 @@
 #define DEFAULT_NULL_FRAC      Float4GetDatum(0.0)
 #define DEFAULT_AVG_WIDTH      Int32GetDatum(0) /* unknown */
 #define DEFAULT_N_DISTINCT     Float4GetDatum(0.0)	/* unknown */
+
+/*
+ * Positional argument numbers, names, and types for
+ * attribute_statistics_update() and pg_restore_attribute_stats().
+ */
 
 enum attribute_stats_argnum
 {
@@ -80,6 +87,11 @@ static struct StatsArgInfo attarginfo[] =
 	[NUM_ATTRIBUTE_STATS_ARGS] = {0}
 };
 
+/*
+ * Positional argument numbers, names, and types for
+ * pg_clear_attribute_stats().
+ */
+
 enum clear_attribute_stats_argnum
 {
 	C_ATTRELSCHEMA_ARG = 0,
@@ -113,7 +125,7 @@ static void set_stats_slot(Datum *values, bool *nulls, bool *replaces,
 						   Datum stanumbers, bool stanumbers_isnull,
 						   Datum stavalues, bool stavalues_isnull);
 static void upsert_pg_statistic(Relation starel, HeapTuple oldtup,
-								Datum *values, bool *nulls, bool *replaces);
+								const Datum *values, const bool *nulls, const bool *replaces);
 static bool delete_pg_statistic(Oid reloid, AttrNumber attnum, bool stainherit);
 static void init_empty_stats_tuple(Oid reloid, int16 attnum, bool inherited,
 								   Datum *values, bool *nulls, bool *replaces);
@@ -143,6 +155,7 @@ attribute_statistics_update(FunctionCallInfo fcinfo)
 	char	   *attname;
 	AttrNumber	attnum;
 	bool		inherited;
+	Oid			locked_table = InvalidOid;
 
 	Relation	starel;
 	HeapTuple	statup;
@@ -182,8 +195,6 @@ attribute_statistics_update(FunctionCallInfo fcinfo)
 	nspname = TextDatumGetCString(PG_GETARG_DATUM(ATTRELSCHEMA_ARG));
 	relname = TextDatumGetCString(PG_GETARG_DATUM(ATTRELNAME_ARG));
 
-	reloid = stats_lookup_relid(nspname, relname);
-
 	if (RecoveryInProgress())
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -191,7 +202,9 @@ attribute_statistics_update(FunctionCallInfo fcinfo)
 				 errhint("Statistics cannot be modified during recovery.")));
 
 	/* lock before looking up attribute */
-	stats_lock_check_privileges(reloid);
+	reloid = RangeVarGetRelidExtended(makeRangeVar(nspname, relname, -1),
+									  ShareUpdateExclusiveLock, 0,
+									  RangeVarCallbackForStats, &locked_table);
 
 	/* user can specify either attname or attnum, but not both */
 	if (!PG_ARGISNULL(ATTNAME_ARG))
@@ -816,7 +829,7 @@ set_stats_slot(Datum *values, bool *nulls, bool *replaces,
  */
 static void
 upsert_pg_statistic(Relation starel, HeapTuple oldtup,
-					Datum *values, bool *nulls, bool *replaces)
+					const Datum *values, const bool *nulls, const bool *replaces)
 {
 	HeapTuple	newtup;
 
@@ -917,6 +930,7 @@ pg_clear_attribute_stats(PG_FUNCTION_ARGS)
 	char	   *attname;
 	AttrNumber	attnum;
 	bool		inherited;
+	Oid			locked_table = InvalidOid;
 
 	stats_check_required_arg(fcinfo, cleararginfo, C_ATTRELSCHEMA_ARG);
 	stats_check_required_arg(fcinfo, cleararginfo, C_ATTRELNAME_ARG);
@@ -926,15 +940,15 @@ pg_clear_attribute_stats(PG_FUNCTION_ARGS)
 	nspname = TextDatumGetCString(PG_GETARG_DATUM(C_ATTRELSCHEMA_ARG));
 	relname = TextDatumGetCString(PG_GETARG_DATUM(C_ATTRELNAME_ARG));
 
-	reloid = stats_lookup_relid(nspname, relname);
-
 	if (RecoveryInProgress())
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("recovery is in progress"),
 				 errhint("Statistics cannot be modified during recovery.")));
 
-	stats_lock_check_privileges(reloid);
+	reloid = RangeVarGetRelidExtended(makeRangeVar(nspname, relname, -1),
+									  ShareUpdateExclusiveLock, 0,
+									  RangeVarCallbackForStats, &locked_table);
 
 	attname = TextDatumGetCString(PG_GETARG_DATUM(C_ATTNAME_ARG));
 	attnum = get_attnum(reloid, attname);

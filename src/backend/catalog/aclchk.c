@@ -580,7 +580,7 @@ ExecuteGrantStmt(GrantStmt *stmt)
 				elog(ERROR, "AccessPriv node must specify privilege or columns");
 			priv = string_to_privilege(privnode->priv_name);
 
-			if (priv & ~((AclMode) all_privileges))
+			if (priv & ~all_privileges)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
 						 errmsg(errormsg, privilege_to_string(priv))));
@@ -1059,7 +1059,7 @@ ExecAlterDefaultPrivilegesStmt(ParseState *pstate, AlterDefaultPrivilegesStmt *s
 				elog(ERROR, "AccessPriv node must specify privilege");
 			priv = string_to_privilege(privnode->priv_name);
 
-			if (priv & ~((AclMode) all_privileges))
+			if (priv & ~all_privileges)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
 						 errmsg(errormsg, privilege_to_string(priv))));
@@ -1207,7 +1207,8 @@ SetDefaultACL(InternalDefaultACL *iacls)
 			if (OidIsValid(iacls->nspid))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
-						 errmsg("cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS")));
+						 errmsg("cannot use IN SCHEMA clause when using %s",
+								"GRANT/REVOKE ON SCHEMAS")));
 			objtype = DEFACLOBJ_NAMESPACE;
 			if (iacls->all_privs && this_privileges == ACL_NO_RIGHTS)
 				this_privileges = ACL_ALL_RIGHTS_SCHEMA;
@@ -1217,7 +1218,8 @@ SetDefaultACL(InternalDefaultACL *iacls)
 			if (OidIsValid(iacls->nspid))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
-						 errmsg("cannot use IN SCHEMA clause when using GRANT/REVOKE ON LARGE OBJECTS")));
+						 errmsg("cannot use IN SCHEMA clause when using %s",
+								"GRANT/REVOKE ON LARGE OBJECTS")));
 			objtype = DEFACLOBJ_LARGEOBJECT;
 			if (iacls->all_privs && this_privileges == ACL_NO_RIGHTS)
 				this_privileges = ACL_ALL_RIGHTS_LARGEOBJECT;
@@ -3125,7 +3127,7 @@ object_aclmask_ext(Oid classid, Oid objectid, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3255,7 +3257,7 @@ pg_attribute_aclmask_ext(Oid table_oid, AttrNumber attnum, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(attTuple);
@@ -3362,7 +3364,7 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3454,7 +3456,7 @@ pg_parameter_aclmask(const char *name, Oid roleid, AclMode mask, AclMaskHow how)
 		result = aclmask(acl, roleid, BOOTSTRAP_SUPERUSERID, mask, how);
 
 		/* if we have a detoasted copy, free it */
-		if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+		if (acl && acl != DatumGetPointer(aclDatum))
 			pfree(acl);
 
 		ReleaseSysCache(tuple);
@@ -3509,7 +3511,7 @@ pg_parameter_acl_aclmask(Oid acl_oid, Oid roleid, AclMode mask, AclMaskHow how)
 	result = aclmask(acl, roleid, BOOTSTRAP_SUPERUSERID, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3589,7 +3591,7 @@ pg_largeobject_aclmask_snapshot(Oid lobj_oid, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	systable_endscan(scan);
@@ -3683,7 +3685,7 @@ pg_namespace_aclmask_ext(Oid nsp_oid, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3819,7 +3821,7 @@ pg_type_aclmask_ext(Oid type_oid, Oid roleid, AclMode mask, AclMaskHow how,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -4003,7 +4005,7 @@ pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
 			attmask = aclmask(acl, roleid, ownerId, mode, ACLMASK_ANY);
 
 			/* if we have a detoasted copy, free it */
-			if ((Pointer) acl != DatumGetPointer(aclDatum))
+			if (acl != DatumGetPointer(aclDatum))
 				pfree(acl);
 		}
 

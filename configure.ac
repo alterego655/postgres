@@ -1214,6 +1214,8 @@ case $MKDIR_P in
   *install-sh*) MKDIR_P='\${SHELL} \${top_srcdir}/config/install-sh -c -d';;
 esac
 
+AC_PATH_PROG(NM, nm)
+AC_SUBST(NM)
 PGAC_PATH_BISON
 PGAC_PATH_FLEX
 
@@ -1513,6 +1515,7 @@ AC_CHECK_HEADERS(m4_normalize([
 	sys/signalfd.h
 	sys/ucred.h
 	termios.h
+	uchar.h
 	ucred.h
 	xlocale.h
 ]))
@@ -1673,7 +1676,8 @@ m4_defun([AC_PROG_CC_STDC], []) dnl We don't want that.
 AC_C_BIGENDIAN
 AC_C_INLINE
 PGAC_PRINTF_ARCHETYPE
-PGAC_C_STATIC_ASSERT
+PGAC_CXX_PRINTF_ARCHETYPE
+PGAC_C_STATEMENT_EXPRESSIONS
 PGAC_C_TYPEOF
 PGAC_C_TYPES_COMPATIBLE
 PGAC_C_BUILTIN_CONSTANT_P
@@ -1685,19 +1689,11 @@ PGAC_UNION_SEMUN
 AC_CHECK_TYPES(socklen_t, [], [], [#include <sys/socket.h>])
 PGAC_STRUCT_SOCKADDR_SA_LEN
 
-# MSVC doesn't cope well with defining restrict to __restrict, the
-# spelling it understands, because it conflicts with
-# __declspec(restrict). Therefore we define pg_restrict to the
-# appropriate definition, which presumably won't conflict.
+# Even though restrict is in C99 and should be supported by all
+# supported compilers, this test is useful because it will prefer a
+# spelling that also works in C++ (often __restrict).  (restrict is
+# not part of the C++ standard.)
 AC_C_RESTRICT
-if test "$ac_cv_c_restrict" = "no"; then
-  pg_restrict=""
-else
-  pg_restrict="$ac_cv_c_restrict"
-fi
-AC_DEFINE_UNQUOTED([pg_restrict], [$pg_restrict],
-[Define to keyword to use for C99 restrict support, or to nothing if not
-supported])
 
 AC_CHECK_TYPES([struct option], [], [],
 [#ifdef HAVE_GETOPT_H
@@ -1760,7 +1756,7 @@ AC_CHECK_SIZEOF([off_t])
 
 # If we don't have largefile support, can't handle segment size >= 2GB.
 if test "$ac_cv_sizeof_off_t" -lt 8; then
-  if expr $RELSEG_SIZE '*' $blocksize '>=' 2 '*' 1024 '*' 1024; then
+  if expr $RELSEG_SIZE '*' $blocksize '>=' 2 '*' 1024 '*' 1024 >/dev/null; then
     AC_MSG_ERROR([Large file support is not enabled. Segment size cannot be larger than 1GB.])
   fi
 fi
@@ -1988,6 +1984,7 @@ AC_CHECK_SIZEOF([void *])
 AC_CHECK_SIZEOF([size_t])
 AC_CHECK_SIZEOF([long])
 AC_CHECK_SIZEOF([long long])
+AC_CHECK_SIZEOF([intmax_t])
 
 # Determine memory alignment requirements for the basic C data types.
 

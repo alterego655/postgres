@@ -114,6 +114,7 @@
 #include "executor/executor.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/lmgr.h"
+#include "utils/injection_point.h"
 #include "utils/multirangetypes.h"
 #include "utils/rangetypes.h"
 #include "utils/snapmgr.h"
@@ -128,7 +129,7 @@ typedef enum
 
 static bool check_exclusion_or_unique_constraint(Relation heap, Relation index,
 												 IndexInfo *indexInfo,
-												 ItemPointer tupleid,
+												 const ItemPointerData *tupleid,
 												 const Datum *values, const bool *isnull,
 												 EState *estate, bool newIndex,
 												 CEOUC_WAIT_MODE waitMode,
@@ -187,8 +188,8 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 	/*
 	 * allocate space for result arrays
 	 */
-	relationDescs = (RelationPtr) palloc(len * sizeof(Relation));
-	indexInfoArray = (IndexInfo **) palloc(len * sizeof(IndexInfo *));
+	relationDescs = palloc_array(Relation, len);
+	indexInfoArray = palloc_array(IndexInfo *, len);
 
 	resultRelInfo->ri_NumIndices = len;
 	resultRelInfo->ri_IndexRelationDescs = relationDescs;
@@ -541,7 +542,7 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 bool
 ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 						  EState *estate, ItemPointer conflictTid,
-						  ItemPointer tupleid, List *arbiterIndexes)
+						  const ItemPointerData *tupleid, List *arbiterIndexes)
 {
 	int			i;
 	int			numIndices;
@@ -703,7 +704,7 @@ ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo, TupleTableSlot *slot,
 static bool
 check_exclusion_or_unique_constraint(Relation heap, Relation index,
 									 IndexInfo *indexInfo,
-									 ItemPointer tupleid,
+									 const ItemPointerData *tupleid,
 									 const Datum *values, const bool *isnull,
 									 EState *estate, bool newIndex,
 									 CEOUC_WAIT_MODE waitMode,
@@ -943,6 +944,11 @@ retry:
 
 	ExecDropSingleTupleTableSlot(existing_slot);
 
+#ifdef USE_INJECTION_POINTS
+	if (!conflict)
+		INJECTION_POINT("check-exclusion-or-unique-constraint-no-conflict", NULL);
+#endif
+
 	return !conflict;
 }
 
@@ -955,7 +961,7 @@ retry:
 void
 check_exclusion_constraint(Relation heap, Relation index,
 						   IndexInfo *indexInfo,
-						   ItemPointer tupleid,
+						   const ItemPointerData *tupleid,
 						   const Datum *values, const bool *isnull,
 						   EState *estate, bool newIndex)
 {

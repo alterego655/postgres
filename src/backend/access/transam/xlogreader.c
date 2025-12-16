@@ -231,7 +231,7 @@ WALOpenSegmentInit(WALOpenSegment *seg, WALSegmentContext *segcxt,
 void
 XLogBeginRead(XLogReaderState *state, XLogRecPtr RecPtr)
 {
-	Assert(!XLogRecPtrIsInvalid(RecPtr));
+	Assert(XLogRecPtrIsValid(RecPtr));
 
 	ResetDecoder(state);
 
@@ -343,7 +343,7 @@ XLogNextRecord(XLogReaderState *state, char **errormsg)
 		 * XLogBeginRead() or XLogNextRecord(), and is the location of the
 		 * error.
 		 */
-		Assert(!XLogRecPtrIsInvalid(state->EndRecPtr));
+		Assert(XLogRecPtrIsValid(state->EndRecPtr));
 
 		return NULL;
 	}
@@ -558,7 +558,7 @@ XLogDecodeNextRecord(XLogReaderState *state, bool nonblocking)
 
 	RecPtr = state->NextRecPtr;
 
-	if (state->DecodeRecPtr != InvalidXLogRecPtr)
+	if (XLogRecPtrIsValid(state->DecodeRecPtr))
 	{
 		/* read the record after the one we just read */
 
@@ -1398,7 +1398,7 @@ XLogFindNextRecord(XLogReaderState *state, XLogRecPtr RecPtr)
 	XLogPageHeader header;
 	char	   *errormsg;
 
-	Assert(!XLogRecPtrIsInvalid(RecPtr));
+	Assert(XLogRecPtrIsValid(RecPtr));
 
 	/* Make sure ReadPageInternal() can't return XLREAD_WOULDBLOCK. */
 	state->nonblocking = false;
@@ -1574,7 +1574,7 @@ WALRead(XLogReaderState *state,
 
 		/* Reset errno first; eases reporting non-errno-affecting errors */
 		errno = 0;
-		readbytes = pg_pread(state->seg.ws_file, p, segbytes, (off_t) startoff);
+		readbytes = pg_pread(state->seg.ws_file, p, segbytes, (pgoff_t) startoff);
 
 #ifndef FRONTEND
 		pgstat_report_wait_end();
@@ -1797,8 +1797,8 @@ DecodeXLogRecord(XLogReaderState *state,
 			if (!blk->has_data && blk->data_len != 0)
 			{
 				report_invalid_record(state,
-									  "BKPBLOCK_HAS_DATA not set, but data length is %u at %X/%08X",
-									  (unsigned int) blk->data_len,
+									  "BKPBLOCK_HAS_DATA not set, but data length is %d at %X/%08X",
+									  blk->data_len,
 									  LSN_FORMAT_ARGS(state->ReadRecPtr));
 				goto err;
 			}
@@ -1833,10 +1833,10 @@ DecodeXLogRecord(XLogReaderState *state,
 					 blk->bimg_len == BLCKSZ))
 				{
 					report_invalid_record(state,
-										  "BKPIMAGE_HAS_HOLE set, but hole offset %u length %u block image length %u at %X/%08X",
-										  (unsigned int) blk->hole_offset,
-										  (unsigned int) blk->hole_length,
-										  (unsigned int) blk->bimg_len,
+										  "BKPIMAGE_HAS_HOLE set, but hole offset %d length %d block image length %d at %X/%08X",
+										  blk->hole_offset,
+										  blk->hole_length,
+										  blk->bimg_len,
 										  LSN_FORMAT_ARGS(state->ReadRecPtr));
 					goto err;
 				}
@@ -1849,9 +1849,9 @@ DecodeXLogRecord(XLogReaderState *state,
 					(blk->hole_offset != 0 || blk->hole_length != 0))
 				{
 					report_invalid_record(state,
-										  "BKPIMAGE_HAS_HOLE not set, but hole offset %u length %u at %X/%08X",
-										  (unsigned int) blk->hole_offset,
-										  (unsigned int) blk->hole_length,
+										  "BKPIMAGE_HAS_HOLE not set, but hole offset %d length %d at %X/%08X",
+										  blk->hole_offset,
+										  blk->hole_length,
 										  LSN_FORMAT_ARGS(state->ReadRecPtr));
 					goto err;
 				}
@@ -1863,8 +1863,8 @@ DecodeXLogRecord(XLogReaderState *state,
 					blk->bimg_len == BLCKSZ)
 				{
 					report_invalid_record(state,
-										  "BKPIMAGE_COMPRESSED set, but block image length %u at %X/%08X",
-										  (unsigned int) blk->bimg_len,
+										  "BKPIMAGE_COMPRESSED set, but block image length %d at %X/%08X",
+										  blk->bimg_len,
 										  LSN_FORMAT_ARGS(state->ReadRecPtr));
 					goto err;
 				}
@@ -1878,8 +1878,8 @@ DecodeXLogRecord(XLogReaderState *state,
 					blk->bimg_len != BLCKSZ)
 				{
 					report_invalid_record(state,
-										  "neither BKPIMAGE_HAS_HOLE nor BKPIMAGE_COMPRESSED set, but block image length is %u at %X/%08X",
-										  (unsigned int) blk->data_len,
+										  "neither BKPIMAGE_HAS_HOLE nor BKPIMAGE_COMPRESSED set, but block image length is %d at %X/%08X",
+										  blk->data_len,
 										  LSN_FORMAT_ARGS(state->ReadRecPtr));
 					goto err;
 				}

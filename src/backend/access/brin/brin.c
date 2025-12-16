@@ -318,7 +318,7 @@ initialize_brin_insertstate(Relation idxRel, IndexInfo *indexInfo)
 	MemoryContext oldcxt;
 
 	oldcxt = MemoryContextSwitchTo(indexInfo->ii_Context);
-	bistate = palloc0(sizeof(BrinInsertState));
+	bistate = palloc0_object(BrinInsertState);
 	bistate->bis_desc = brin_build_desc(idxRel);
 	bistate->bis_rmAccess = brinRevmapInitialize(idxRel,
 												 &bistate->bis_pages_per_range);
@@ -573,7 +573,6 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	Relation	heapRel;
 	BrinOpaque *opaque;
 	BlockNumber nblocks;
-	BlockNumber heapBlk;
 	int64		totalpages = 0;
 	FmgrInfo   *consistentFn;
 	MemoryContext oldcxt;
@@ -735,9 +734,10 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	/*
 	 * Now scan the revmap.  We start by querying for heap page 0,
 	 * incrementing by the number of pages per range; this gives us a full
-	 * view of the table.
+	 * view of the table.  We make use of uint64 for heapBlk as a BlockNumber
+	 * could wrap for tables with close to 2^32 pages.
 	 */
-	for (heapBlk = 0; heapBlk < nblocks; heapBlk += opaque->bo_pagesPerRange)
+	for (uint64 heapBlk = 0; heapBlk < nblocks; heapBlk += opaque->bo_pagesPerRange)
 	{
 		bool		addrange;
 		bool		gottuple = false;
@@ -749,7 +749,7 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 		MemoryContextReset(perRangeCxt);
 
-		tup = brinGetTupleForHeapBlock(opaque->bo_rmAccess, heapBlk, &buf,
+		tup = brinGetTupleForHeapBlock(opaque->bo_rmAccess, (BlockNumber) heapBlk, &buf,
 									   &off, &size, BUFFER_LOCK_SHARE);
 		if (tup)
 		{
@@ -924,7 +924,7 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		/* add the pages in the range to the output bitmap, if needed */
 		if (addrange)
 		{
-			BlockNumber pageno;
+			uint64		pageno;
 
 			for (pageno = heapBlk;
 				 pageno <= Min(nblocks, heapBlk + opaque->bo_pagesPerRange) - 1;
@@ -1185,7 +1185,7 @@ brinbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	{
 		SortCoordinate coordinate;
 
-		coordinate = (SortCoordinate) palloc0(sizeof(SortCoordinateData));
+		coordinate = palloc0_object(SortCoordinateData);
 		coordinate->isWorker = false;
 		coordinate->nParticipants =
 			state->bs_leader->nparticipanttuplesorts;
@@ -2171,27 +2171,41 @@ union_tuples(BrinDesc *bdesc, BrinMemTuple *a, BrinTuple *b)
 static void
 brin_vacuum_scan(Relation idxrel, BufferAccessStrategy strategy)
 {
-	BlockNumber nblocks;
-	BlockNumber blkno;
+	BlockRangeReadStreamPrivate p;
+	ReadStream *stream;
+	Buffer		buf;
+
+	p.current_blocknum = 0;
+	p.last_exclusive = RelationGetNumberOfBlocks(idxrel);
+
+	/*
+	 * It is safe to use batchmode as block_range_read_stream_cb takes no
+	 * locks.
+	 */
+	stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE |
+										READ_STREAM_FULL |
+										READ_STREAM_USE_BATCHING,
+										strategy,
+										idxrel,
+										MAIN_FORKNUM,
+										block_range_read_stream_cb,
+										&p,
+										0);
 
 	/*
 	 * Scan the index in physical order, and clean up any possible mess in
 	 * each page.
 	 */
-	nblocks = RelationGetNumberOfBlocks(idxrel);
-	for (blkno = 0; blkno < nblocks; blkno++)
+	while ((buf = read_stream_next_buffer(stream, NULL)) != InvalidBuffer)
 	{
-		Buffer		buf;
-
 		CHECK_FOR_INTERRUPTS();
-
-		buf = ReadBufferExtended(idxrel, MAIN_FORKNUM, blkno,
-								 RBM_NORMAL, strategy);
 
 		brin_page_cleanup(idxrel, buf);
 
 		ReleaseBuffer(buf);
 	}
+
+	read_stream_end(stream);
 
 	/*
 	 * Update all upper pages in the index's FSM, as well.  This ensures not
@@ -2370,7 +2384,7 @@ _brin_begin_parallel(BrinBuildState *buildstate, Relation heap, Relation index,
 	Size		estsort;
 	BrinShared *brinshared;
 	Sharedsort *sharedsort;
-	BrinLeader *brinleader = (BrinLeader *) palloc0(sizeof(BrinLeader));
+	BrinLeader *brinleader = palloc0_object(BrinLeader);
 	WalUsage   *walusage;
 	BufferUsage *bufferusage;
 	bool		leaderparticipates = true;
@@ -2814,7 +2828,7 @@ _brin_parallel_scan_and_build(BrinBuildState *state,
 	IndexInfo  *indexInfo;
 
 	/* Initialize local tuplesort coordination state */
-	coordinate = palloc0(sizeof(SortCoordinateData));
+	coordinate = palloc0_object(SortCoordinateData);
 	coordinate->isWorker = true;
 	coordinate->nParticipants = -1;
 	coordinate->sharedsort = sharedsort;

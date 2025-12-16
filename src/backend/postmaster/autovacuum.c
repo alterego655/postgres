@@ -133,6 +133,7 @@ double		autovacuum_vac_cost_delay;
 int			autovacuum_vac_cost_limit;
 
 int			Log_autovacuum_min_duration = 600000;
+int			Log_autoanalyze_min_duration = 600000;
 
 /* the minimum allowed time between two awakenings of the launcher */
 #define MIN_AUTOVAC_SLEEPTIME 100.0 /* milliseconds */
@@ -1864,7 +1865,7 @@ get_database_list(void)
 		 */
 		oldcxt = MemoryContextSwitchTo(resultcxt);
 
-		avdb = (avw_dbase *) palloc(sizeof(avw_dbase));
+		avdb = palloc_object(avw_dbase);
 
 		avdb->adw_datid = pgdatabase->oid;
 		avdb->adw_name = pstrdup(NameStr(pgdatabase->datname));
@@ -1935,8 +1936,8 @@ do_autovacuum(void)
 
 	/*
 	 * Compute the multixact age for which freezing is urgent.  This is
-	 * normally autovacuum_multixact_freeze_max_age, but may be less if we are
-	 * short of multixact member space.
+	 * normally autovacuum_multixact_freeze_max_age, but may be less if
+	 * multixact members are bloated.
 	 */
 	effective_multixact_freeze_max_age = MultiXactMemberFreezeThreshold();
 
@@ -2555,7 +2556,10 @@ deleted:
 		workitem->avw_active = true;
 		LWLockRelease(AutovacuumLock);
 
+		PushActiveSnapshot(GetTransactionSnapshot());
 		perform_work_item(workitem);
+		if (ActiveSnapshotSet())	/* transaction could have aborted */
+			PopActiveSnapshot();
 
 		/*
 		 * Check for config changes before acquiring lock for further jobs.
@@ -2749,7 +2753,7 @@ extract_autovac_opts(HeapTuple tup, TupleDesc pg_class_desc)
 	if (relopts == NULL)
 		return NULL;
 
-	av = palloc(sizeof(AutoVacOpts));
+	av = palloc_object(AutoVacOpts);
 	memcpy(av, &(((StdRdOptions *) relopts)->autovacuum), sizeof(AutoVacOpts));
 	pfree(relopts);
 
@@ -2814,7 +2818,8 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 		int			freeze_table_age;
 		int			multixact_freeze_min_age;
 		int			multixact_freeze_table_age;
-		int			log_min_duration;
+		int			log_vacuum_min_duration;
+		int			log_analyze_min_duration;
 
 		/*
 		 * Calculate the vacuum cost parameters and the freeze ages.  If there
@@ -2824,9 +2829,14 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 		 */
 
 		/* -1 in autovac setting means use log_autovacuum_min_duration */
-		log_min_duration = (avopts && avopts->log_min_duration >= 0)
-			? avopts->log_min_duration
+		log_vacuum_min_duration = (avopts && avopts->log_vacuum_min_duration >= 0)
+			? avopts->log_vacuum_min_duration
 			: Log_autovacuum_min_duration;
+
+		/* -1 in autovac setting means use log_autoanalyze_min_duration */
+		log_analyze_min_duration = (avopts && avopts->log_analyze_min_duration >= 0)
+			? avopts->log_analyze_min_duration
+			: Log_autoanalyze_min_duration;
 
 		/* these do not have autovacuum-specific settings */
 		freeze_min_age = (avopts && avopts->freeze_min_age >= 0)
@@ -2847,7 +2857,7 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 			? avopts->multixact_freeze_table_age
 			: default_multixact_freeze_table_age;
 
-		tab = palloc(sizeof(autovac_table));
+		tab = palloc_object(autovac_table);
 		tab->at_relid = relid;
 		tab->at_sharedrel = classForm->relisshared;
 
@@ -2877,7 +2887,8 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 		tab->at_params.multixact_freeze_min_age = multixact_freeze_min_age;
 		tab->at_params.multixact_freeze_table_age = multixact_freeze_table_age;
 		tab->at_params.is_wraparound = wraparound;
-		tab->at_params.log_min_duration = log_min_duration;
+		tab->at_params.log_vacuum_min_duration = log_vacuum_min_duration;
+		tab->at_params.log_analyze_min_duration = log_analyze_min_duration;
 		tab->at_params.toast_parent = InvalidOid;
 
 		/*
@@ -3147,11 +3158,6 @@ relation_needs_vacanalyze(Oid relid,
 			vac_ins_scale_factor * reltuples * pcnt_unfrozen;
 		anlthresh = (float4) anl_base_thresh + anl_scale_factor * reltuples;
 
-		/*
-		 * Note that we don't need to take special consideration for stat
-		 * reset, because if that happens, the last vacuum and analyze counts
-		 * will be reset too.
-		 */
 		if (vac_ins_base_thresh >= 0)
 			elog(DEBUG3, "%s: vac: %.0f (threshold %.0f), ins: %.0f (threshold %.0f), anl: %.0f (threshold %.0f)",
 				 NameStr(classForm->relname),

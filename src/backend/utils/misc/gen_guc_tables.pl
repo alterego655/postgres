@@ -25,10 +25,7 @@ my $parse = Catalog::ParseData($input_fname);
 open my $ofh, '>', $output_fname or die;
 
 print_boilerplate($ofh, $output_fname, 'GUC tables');
-foreach my $type (qw(bool int real string enum))
-{
-	print_one_table($ofh, $type);
-}
+print_table($ofh);
 
 close $ofh;
 
@@ -41,64 +38,119 @@ sub dquote
 	return q{"} . $s =~ s/"/\\"/gr . q{"};
 }
 
-# Print GUC table for one type.
-sub print_one_table
+sub validate_guc_entry
 {
-	my ($ofh, $type) = @_;
-	my $Type = ucfirst $type;
+	my ($entry) = @_;
+
+	my @required_common =
+	  qw(name type context group short_desc variable boot_val);
+
+	my %required_by_type = (
+		int => [qw(min max)],
+		real => [qw(min max)],
+		enum => [qw(options)],
+		bool => [],      # no extra required fields
+		string => [],    # no extra required fields
+	);
+
+	for my $f (@required_common)
+	{
+		unless (defined $entry->{$f})
+		{
+			die sprintf(
+				qq{%s:%d: error: entry "%s" is missing required field "%s"\n},
+				$input_fname, $entry->{line_number},
+				$entry->{name} // '<unknown>', $f);
+		}
+	}
+
+	unless (exists $required_by_type{ $entry->{type} })
+	{
+		die sprintf(
+			qq{%s:%d: error: entry "%s" has unrecognized GUC type "%s"\n},
+			$input_fname, $entry->{line_number},
+			$entry->{name}, $entry->{type} // '<unknown>');
+	}
+
+	for my $f (@{ $required_by_type{ $entry->{type} } })
+	{
+		unless (defined $entry->{$f})
+		{
+			die sprintf(
+				qq{%s:%d: error: entry "%s" of type "%s" is missing required field "%s"\n},
+				$input_fname, $entry->{line_number}, $entry->{name},
+				$entry->{type}, $f);
+		}
+	}
+}
+
+# Print GUC table.
+sub print_table
+{
+	my ($ofh) = @_;
+	my $prev_name = undef;
 
 	print $ofh "\n\n";
-	print $ofh "struct config_${type} ConfigureNames${Type}[] =\n";
+	print $ofh "struct config_generic ConfigureNames[] =\n";
 	print $ofh "{\n";
 
 	foreach my $entry (@{$parse})
 	{
-		next if $entry->{type} ne $type;
+		validate_guc_entry($entry);
+
+		if (defined($prev_name) && lc($prev_name) ge lc($entry->{name}))
+		{
+			die sprintf(
+				"entries are not in alphabetical order: \"%s\", \"%s\"\n",
+				$prev_name, $entry->{name});
+		}
 
 		print $ofh "#ifdef $entry->{ifdef}\n" if $entry->{ifdef};
 		print $ofh "\t{\n";
-		printf $ofh "\t\t{%s, %s, %s,\n",
-		  dquote($entry->{name}),
-		  $entry->{context},
-		  $entry->{group};
-		printf $ofh "\t\t\tgettext_noop(%s),\n", dquote($entry->{short_desc});
+		printf $ofh "\t\t.name = %s,\n", dquote($entry->{name});
+		printf $ofh "\t\t.context = %s,\n", $entry->{context};
+		printf $ofh "\t\t.group = %s,\n", $entry->{group};
+		printf $ofh
+		  "\t\t/* translator: GUC parameter \"%s\" short description */\n",
+		  $entry->{name};
+		printf $ofh "\t\t.short_desc = gettext_noop(%s),\n",
+		  dquote($entry->{short_desc});
+
 		if ($entry->{long_desc})
 		{
-			printf $ofh "\t\t\tgettext_noop(%s)", dquote($entry->{long_desc});
+			printf $ofh
+			  "\t\t/* translator: GUC parameter \"%s\" long description */\n",
+			  $entry->{name};
+			printf $ofh "\t\t.long_desc = gettext_noop(%s),\n",
+			  dquote($entry->{long_desc});
 		}
-		else
-		{
-			print $ofh "\t\t\tNULL";
-		}
-		if ($entry->{flags})
-		{
-			print $ofh ",\n\t\t\t$entry->{flags}\n";
-		}
-		else
-		{
-			print $ofh "\n";
-		}
-		print $ofh "\t\t},\n";
-		print $ofh "\t\t&$entry->{variable},\n";
-		print $ofh "\t\t$entry->{boot_val},";
-		print $ofh " $entry->{min},"
+		printf $ofh "\t\t.flags = %s,\n", $entry->{flags} if $entry->{flags};
+		printf $ofh "\t\t.vartype = %s,\n", ('PGC_' . uc($entry->{type}));
+		printf $ofh "\t\t._%s = {\n", $entry->{type};
+		printf $ofh "\t\t\t.variable = &%s,\n", $entry->{variable};
+		printf $ofh "\t\t\t.boot_val = %s,\n", $entry->{boot_val};
+		printf $ofh "\t\t\t.min = %s,\n", $entry->{min}
 		  if $entry->{type} eq 'int' || $entry->{type} eq 'real';
-		print $ofh " $entry->{max},"
+		printf $ofh "\t\t\t.max = %s,\n", $entry->{max}
 		  if $entry->{type} eq 'int' || $entry->{type} eq 'real';
-		print $ofh " $entry->{options},"
+		printf $ofh "\t\t\t.options = %s,\n", $entry->{options}
 		  if $entry->{type} eq 'enum';
-		print $ofh "\n";
-		printf $ofh "\t\t%s, %s, %s\n",
-		  ($entry->{check_hook} || 'NULL'),
-		  ($entry->{assign_hook} || 'NULL'),
-		  ($entry->{show_hook} || 'NULL');
+		printf $ofh "\t\t\t.check_hook = %s,\n", $entry->{check_hook}
+		  if $entry->{check_hook};
+		printf $ofh "\t\t\t.assign_hook = %s,\n", $entry->{assign_hook}
+		  if $entry->{assign_hook};
+		printf $ofh "\t\t\t.show_hook = %s,\n", $entry->{show_hook}
+		  if $entry->{show_hook};
+		print $ofh "\t\t},\n";
 		print $ofh "\t},\n";
 		print $ofh "#endif\n" if $entry->{ifdef};
 		print $ofh "\n";
+
+		$prev_name = $entry->{name};
 	}
 
 	print $ofh "\t/* End-of-list marker */\n";
-	print $ofh "\t{{0}}\n";
+	print $ofh "\t{0}\n";
 	print $ofh "};\n";
 
 	return;

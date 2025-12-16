@@ -114,6 +114,7 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
 #include <math.h>
 
 #include "access/brin.h"
@@ -126,6 +127,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
+#include "port/pg_bitutils.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
 

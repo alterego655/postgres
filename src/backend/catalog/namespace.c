@@ -2753,6 +2753,9 @@ StatisticsObjIsVisibleExt(Oid stxid, bool *is_missing)
 		{
 			Oid			namespaceId = lfirst_oid(l);
 
+			if (namespaceId == myTempNamespace)
+				continue;		/* do not look in temp namespace */
+
 			if (namespaceId == stxnamespace)
 			{
 				/* Found it first in path */
@@ -3926,7 +3929,7 @@ GetSearchPathMatcher(MemoryContext context)
 
 	oldcxt = MemoryContextSwitchTo(context);
 
-	result = (SearchPathMatcher *) palloc0(sizeof(SearchPathMatcher));
+	result = palloc0_object(SearchPathMatcher);
 	schemas = list_copy(activeSearchPath);
 	while (schemas && linitial_oid(schemas) != activeCreationNamespace)
 	{
@@ -3957,7 +3960,7 @@ CopySearchPathMatcher(SearchPathMatcher *path)
 {
 	SearchPathMatcher *result;
 
-	result = (SearchPathMatcher *) palloc(sizeof(SearchPathMatcher));
+	result = palloc_object(SearchPathMatcher);
 	result->schemas = list_copy(path->schemas);
 	result->addCatalog = path->addCatalog;
 	result->addTemp = path->addTemp;

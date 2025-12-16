@@ -44,10 +44,10 @@ gistfillbuffer(Page page, IndexTuple *itup, int len, OffsetNumber off)
 		Size		sz = IndexTupleSize(itup[i]);
 		OffsetNumber l;
 
-		l = PageAddItem(page, (Item) itup[i], sz, off, false, false);
+		l = PageAddItem(page, itup[i], sz, off, false, false);
 		if (l == InvalidOffsetNumber)
-			elog(ERROR, "failed to add item to GiST index page, item %d out of %d, size %d bytes",
-				 i, len, (int) sz);
+			elog(ERROR, "failed to add item to GiST index page, item %d out of %d, size %zu bytes",
+				 i, len, sz);
 		off++;
 	}
 }
@@ -100,7 +100,7 @@ gistextractpage(Page page, int *len /* out */ )
 
 	maxoff = PageGetMaxOffsetNumber(page);
 	*len = maxoff;
-	itvec = palloc(sizeof(IndexTuple) * maxoff);
+	itvec = palloc_array(IndexTuple, maxoff);
 	for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
 		itvec[i - FirstOffsetNumber] = (IndexTuple) PageGetItem(page, PageGetItemId(page, i));
 
@@ -113,7 +113,7 @@ gistextractpage(Page page, int *len /* out */ )
 IndexTuple *
 gistjoinvector(IndexTuple *itvec, int *len, IndexTuple *additvec, int addlen)
 {
-	itvec = (IndexTuple *) repalloc(itvec, sizeof(IndexTuple) * ((*len) + addlen));
+	itvec = repalloc_array(itvec, IndexTuple, (*len) + addlen);
 	memmove(&itvec[*len], additvec, sizeof(IndexTuple) * addlen);
 	*len += addlen;
 	return itvec;
@@ -1040,7 +1040,7 @@ gistGetFakeLSN(Relation rel)
 		Assert(!RelationNeedsWAL(rel));
 
 		/* No need for an actual record if we already have a distinct LSN */
-		if (!XLogRecPtrIsInvalid(lastlsn) && lastlsn == currlsn)
+		if (XLogRecPtrIsValid(lastlsn) && lastlsn == currlsn)
 			currlsn = gistXLogAssignLSN();
 
 		lastlsn = currlsn;

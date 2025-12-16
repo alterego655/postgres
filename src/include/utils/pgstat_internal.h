@@ -64,6 +64,20 @@ typedef struct PgStat_HashKey
 } PgStat_HashKey;
 
 /*
+ * Tracks if the stats file is being read, written or discarded, used in
+ * combination with the finish callback.
+ *
+ * These states allow plugins that create auxiliary data files to determine
+ * the current operation and perform any necessary file cleanup.
+ */
+typedef enum PgStat_StatsFileOp
+{
+	STATS_WRITE,
+	STATS_READ,
+	STATS_DISCARD,
+} PgStat_StatsFileOp;
+
+/*
  * PgStat_HashKey should not have any padding.  Checking that the structure
  * size matches with the sum of each field is a check simple enough to
  * enforce this policy.
@@ -232,6 +246,12 @@ typedef struct PgStat_KindInfo
 	bool		write_to_file:1;
 
 	/*
+	 * Should the number of entries be tracked?  For variable-numbered stats,
+	 * to update its PgStat_ShmemControl.entry_counts.
+	 */
+	bool		track_entry_count:1;
+
+	/*
 	 * The size of an entry in the shared stats hash table (pointed to by
 	 * PgStatShared_HashEntry->body).  For fixed-numbered statistics, this is
 	 * the size of an entry in PgStat_ShmemControl->custom_data.
@@ -296,6 +316,38 @@ typedef struct PgStat_KindInfo
 	void		(*to_serialized_name) (const PgStat_HashKey *key,
 									   const PgStatShared_Common *header, NameData *name);
 	bool		(*from_serialized_name) (const NameData *name, PgStat_HashKey *key);
+
+	/*
+	 * For variable-numbered stats: read or write additional data related to
+	 * an entry, in the stats file or optionally in a different file.
+	 * Optional.
+	 *
+	 * to_serialized_data: write auxiliary data for an entry.
+	 *
+	 * from_serialized_data: read auxiliary data for an entry.  Returns true
+	 * on success, false on read error.
+	 *
+	 * "statfile" is a pointer to the on-disk stats file, named
+	 * PGSTAT_STAT_PERMANENT_FILENAME.  "key" is the hash key of the entry
+	 * just written or read.  "header" is a pointer to the stats data.
+	 */
+	void		(*to_serialized_data) (const PgStat_HashKey *key,
+									   const PgStatShared_Common *header,
+									   FILE *statfile);
+	bool		(*from_serialized_data) (const PgStat_HashKey *key,
+										 const PgStatShared_Common *header,
+										 FILE *statfile);
+
+	/*
+	 * For fixed-numbered or variable-numbered statistics.
+	 *
+	 * Perform custom actions when done processing the on-disk stats file
+	 * after all the stats entries have been processed.  Optional.
+	 *
+	 * "status" tracks the operation done for the on-disk stats file (read,
+	 * write, discard).
+	 */
+	void		(*finish) (PgStat_StatsFileOp status);
 
 	/*
 	 * For fixed-numbered statistics: Initialize shared memory state.
@@ -501,6 +553,16 @@ typedef struct PgStat_ShmemControl
 	pg_atomic_uint64 gc_request_count;
 
 	/*
+	 * Counters for the number of entries associated to a single stats kind
+	 * that uses variable-numbered objects stored in the shared hash table.
+	 * These counters can be enabled on a per-kind basis, when
+	 * track_entry_count is set.  This counter is incremented each time a new
+	 * entry is created (not reused) in the shared hash table, and is
+	 * decremented each time an entry is freed from the shared hash table.
+	 */
+	pg_atomic_uint64 entry_counts[PGSTAT_KIND_MAX];
+
+	/*
 	 * Stats data for fixed-numbered objects.
 	 */
 	PgStatShared_Archiver archiver;
@@ -675,6 +737,7 @@ extern void pgstat_database_reset_timestamp_cb(PgStatShared_Common *header, Time
  */
 
 extern bool pgstat_function_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
+extern void pgstat_function_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
 
 
 /*
@@ -700,6 +763,7 @@ extern void PostPrepare_PgStat_Relations(PgStat_SubXactStatus *xact_state);
 
 extern bool pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait);
 extern void pgstat_relation_delete_pending_cb(PgStat_EntryRef *entry_ref);
+extern void pgstat_relation_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts);
 
 
 /*
@@ -799,6 +863,12 @@ extern PGDLLIMPORT bool pgstat_report_fixed;
 
 /* Backend-local stats state */
 extern PGDLLIMPORT PgStat_LocalState pgStatLocal;
+
+/* Helper functions for reading and writing of on-disk stats file */
+extern void pgstat_write_chunk(FILE *fpout, void *ptr, size_t len);
+extern bool pgstat_read_chunk(FILE *fpin, void *ptr, size_t len);
+#define pgstat_read_chunk_s(fpin, ptr) pgstat_read_chunk(fpin, ptr, sizeof(*ptr))
+#define pgstat_write_chunk_s(fpout, ptr) pgstat_write_chunk(fpout, ptr, sizeof(*ptr))
 
 /*
  * Implementation of inline functions declared above.
@@ -923,6 +993,17 @@ pgstat_get_entry_data(PgStat_Kind kind, PgStatShared_Common *entry)
 	Assert(off != 0 && off < PG_UINT32_MAX);
 
 	return ((char *) (entry)) + off;
+}
+
+/*
+ * Returns the number of entries counted for a stats kind.
+ */
+static inline uint64
+pgstat_get_entry_count(PgStat_Kind kind)
+{
+	Assert(pgstat_get_kind_info(kind)->track_entry_count);
+
+	return pg_atomic_read_u64(&pgStatLocal.shmem->entry_counts[kind - 1]);
 }
 
 /*

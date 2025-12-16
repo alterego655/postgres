@@ -62,6 +62,7 @@
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "access/xlogwait.h"
 #include "backup/basebackup.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
@@ -749,6 +750,7 @@ XLogInsertRecord(XLogRecData *rdata,
 				 XLogRecPtr fpw_lsn,
 				 uint8 flags,
 				 int num_fpi,
+				 uint64 fpi_bytes,
 				 bool topxid_included)
 {
 	XLogCtlInsert *Insert = &XLogCtl->Insert;
@@ -847,7 +849,7 @@ XLogInsertRecord(XLogRecData *rdata,
 
 		if (doPageWrites &&
 			(!prevDoPageWrites ||
-			 (fpw_lsn != InvalidXLogRecPtr && fpw_lsn <= RedoRecPtr)))
+			 (XLogRecPtrIsValid(fpw_lsn) && fpw_lsn <= RedoRecPtr)))
 		{
 			/*
 			 * Oops, some buffer now needs to be backed up that the caller
@@ -881,7 +883,7 @@ XLogInsertRecord(XLogRecData *rdata,
 		 * Those checks are only needed for records that can contain buffer
 		 * references, and an XLOG_SWITCH record never does.
 		 */
-		Assert(fpw_lsn == InvalidXLogRecPtr);
+		Assert(!XLogRecPtrIsValid(fpw_lsn));
 		WALInsertLockAcquireExclusive();
 		inserted = ReserveXLogSwitch(&StartPos, &EndPos, &rechdr->xl_prev);
 	}
@@ -896,7 +898,7 @@ XLogInsertRecord(XLogRecData *rdata,
 		 * not check RedoRecPtr before inserting the record; we just need to
 		 * update it afterwards.
 		 */
-		Assert(fpw_lsn == InvalidXLogRecPtr);
+		Assert(!XLogRecPtrIsValid(fpw_lsn));
 		WALInsertLockAcquireExclusive();
 		ReserveXLogInsertLocation(rechdr->xl_tot_len, &StartPos, &EndPos,
 								  &rechdr->xl_prev);
@@ -1081,6 +1083,7 @@ XLogInsertRecord(XLogRecData *rdata,
 		pgWalUsage.wal_bytes += rechdr->xl_tot_len;
 		pgWalUsage.wal_records++;
 		pgWalUsage.wal_fpi += num_fpi;
+		pgWalUsage.wal_fpi_bytes += fpi_bytes;
 
 		/* Required for the flush of pending stats WAL data */
 		pgstat_report_fixed = true;
@@ -1600,7 +1603,7 @@ WaitXLogInsertionsToFinish(XLogRecPtr upto)
 			 */
 		} while (insertingat < upto);
 
-		if (insertingat != InvalidXLogRecPtr && insertingat < finishedUpto)
+		if (XLogRecPtrIsValid(insertingat) && insertingat < finishedUpto)
 			finishedUpto = insertingat;
 	}
 
@@ -1759,7 +1762,7 @@ WALReadFromBuffers(char *dstbuf, XLogRecPtr startptr, Size count,
 	if (RecoveryInProgress() || tli != GetWALInsertionTimeLine())
 		return 0;
 
-	Assert(!XLogRecPtrIsInvalid(startptr));
+	Assert(XLogRecPtrIsValid(startptr));
 
 	/*
 	 * Caller should ensure that the requested data has been inserted into WAL
@@ -2714,7 +2717,7 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 	 * available is replayed in this case.  This also saves from extra locks
 	 * taken on the control file from the startup process.
 	 */
-	if (XLogRecPtrIsInvalid(LocalMinRecoveryPoint) && InRecovery)
+	if (!XLogRecPtrIsValid(LocalMinRecoveryPoint) && InRecovery)
 	{
 		updateMinRecoveryPoint = false;
 		return;
@@ -2726,7 +2729,7 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 	LocalMinRecoveryPoint = ControlFile->minRecoveryPoint;
 	LocalMinRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
 
-	if (XLogRecPtrIsInvalid(LocalMinRecoveryPoint))
+	if (!XLogRecPtrIsValid(LocalMinRecoveryPoint))
 		updateMinRecoveryPoint = false;
 	else if (force || LocalMinRecoveryPoint < lsn)
 	{
@@ -2881,7 +2884,9 @@ XLogFlush(XLogRecPtr record)
 		if (CommitDelay > 0 && enableFsync &&
 			MinimumActiveBackends(CommitSiblings))
 		{
+			pgstat_report_wait_start(WAIT_EVENT_COMMIT_DELAY);
 			pg_usleep(CommitDelay);
+			pgstat_report_wait_end();
 
 			/*
 			 * Re-check how far we can now flush the WAL. It's generally not
@@ -3134,6 +3139,10 @@ XLogNeedsFlush(XLogRecPtr record)
 	 */
 	if (!XLogInsertAllowed())
 	{
+		/* Quick exit if already known to be updated or cannot be updated */
+		if (!updateMinRecoveryPoint || record <= LocalMinRecoveryPoint)
+			return false;
+
 		/*
 		 * An invalid minRecoveryPoint means that we need to recover all the
 		 * WAL, i.e., we're doing crash recovery.  We never modify the control
@@ -3142,12 +3151,11 @@ XLogNeedsFlush(XLogRecPtr record)
 		 * which cannot update its local copy of minRecoveryPoint as long as
 		 * it has not replayed all WAL available when doing crash recovery.
 		 */
-		if (XLogRecPtrIsInvalid(LocalMinRecoveryPoint) && InRecovery)
+		if (!XLogRecPtrIsValid(LocalMinRecoveryPoint) && InRecovery)
+		{
 			updateMinRecoveryPoint = false;
-
-		/* Quick exit if already known to be updated or cannot be updated */
-		if (record <= LocalMinRecoveryPoint || !updateMinRecoveryPoint)
 			return false;
+		}
 
 		/*
 		 * Update local copy of minRecoveryPoint. But if the lock is busy,
@@ -3164,7 +3172,7 @@ XLogNeedsFlush(XLogRecPtr record)
 		 * process doing crash recovery, which should not update the control
 		 * file value if crash recovery is still running.
 		 */
-		if (XLogRecPtrIsInvalid(LocalMinRecoveryPoint))
+		if (!XLogRecPtrIsValid(LocalMinRecoveryPoint))
 			updateMinRecoveryPoint = false;
 
 		/* check again */
@@ -4265,6 +4273,7 @@ WriteControlFile(void)
 
 	ControlFile->blcksz = BLCKSZ;
 	ControlFile->relseg_size = RELSEG_SIZE;
+	ControlFile->slru_pages_per_segment = SLRU_PAGES_PER_SEGMENT;
 	ControlFile->xlog_blcksz = XLOG_BLCKSZ;
 	ControlFile->xlog_seg_size = wal_segment_size;
 
@@ -4483,6 +4492,16 @@ ReadControlFile(void)
 						   " but the server was compiled with %s %d.",
 						   "RELSEG_SIZE", ControlFile->relseg_size,
 						   "RELSEG_SIZE", RELSEG_SIZE),
+				 errhint("It looks like you need to recompile or initdb.")));
+	if (ControlFile->slru_pages_per_segment != SLRU_PAGES_PER_SEGMENT)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("database files are incompatible with server"),
+		/* translator: %s is a variable name and %d is its value */
+				 errdetail("The database cluster was initialized with %s %d,"
+						   " but the server was compiled with %s %d.",
+						   "SLRU_PAGES_PER_SEGMENT", ControlFile->slru_pages_per_segment,
+						   "SLRU_PAGES_PER_SEGMENT", SLRU_PAGES_PER_SEGMENT),
 				 errhint("It looks like you need to recompile or initdb.")));
 	if (ControlFile->xlog_blcksz != XLOG_BLCKSZ)
 		ereport(FATAL,
@@ -4885,7 +4904,7 @@ void
 LocalProcessControlFile(bool reset)
 {
 	Assert(reset || ControlFile == NULL);
-	ControlFile = palloc(sizeof(ControlFileData));
+	ControlFile = palloc_object(ControlFileData);
 	ReadControlFile();
 }
 
@@ -5072,7 +5091,7 @@ void
 BootStrapXLOG(uint32 data_checksum_version)
 {
 	CheckPoint	checkPoint;
-	char	   *buffer;
+	PGAlignedXLogBlock buffer;
 	XLogPageHeader page;
 	XLogLongPageHeader longpage;
 	XLogRecord *record;
@@ -5101,10 +5120,8 @@ BootStrapXLOG(uint32 data_checksum_version)
 	sysidentifier |= ((uint64) tv.tv_usec) << 12;
 	sysidentifier |= getpid() & 0xFFF;
 
-	/* page buffer must be aligned suitably for O_DIRECT */
-	buffer = (char *) palloc(XLOG_BLCKSZ + XLOG_BLCKSZ);
-	page = (XLogPageHeader) TYPEALIGN(XLOG_BLCKSZ, buffer);
-	memset(page, 0, XLOG_BLCKSZ);
+	memset(&buffer, 0, sizeof buffer);
+	page = (XLogPageHeader) &buffer;
 
 	/*
 	 * Set up information for the initial checkpoint record
@@ -5122,7 +5139,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 		FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId);
 	checkPoint.nextOid = FirstGenbkiObjectId;
 	checkPoint.nextMulti = FirstMultiXactId;
-	checkPoint.nextMultiOffset = 0;
+	checkPoint.nextMultiOffset = 1;
 	checkPoint.oldestXid = FirstNormalTransactionId;
 	checkPoint.oldestXidDB = Template1DbOid;
 	checkPoint.oldestMulti = FirstMultiXactId;
@@ -5138,7 +5155,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
 	AdvanceOldestClogXid(checkPoint.oldestXid);
 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
-	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB, true);
+	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB);
 	SetCommitTsLimit(InvalidTransactionId, InvalidTransactionId);
 
 	/* Set up the XLOG page header */
@@ -5185,7 +5202,7 @@ BootStrapXLOG(uint32 data_checksum_version)
 	/* Write the first page with the initial record */
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_WAL_BOOTSTRAP_WRITE);
-	if (write(openLogFile, page, XLOG_BLCKSZ) != XLOG_BLCKSZ)
+	if (write(openLogFile, &buffer, XLOG_BLCKSZ) != XLOG_BLCKSZ)
 	{
 		/* if write didn't set errno, assume problem is no disk space */
 		if (errno == 0)
@@ -5224,8 +5241,6 @@ BootStrapXLOG(uint32 data_checksum_version)
 	BootStrapCommitTs();
 	BootStrapSUBTRANS();
 	BootStrapMultiXact();
-
-	pfree(buffer);
 
 	/*
 	 * Force control file to be read - in contrast to normal processing we'd
@@ -5619,7 +5634,7 @@ StartupXLOG(void)
 	MultiXactSetNextMXact(checkPoint.nextMulti, checkPoint.nextMultiOffset);
 	AdvanceOldestClogXid(checkPoint.oldestXid);
 	SetTransactionIdLimit(checkPoint.oldestXid, checkPoint.oldestXidDB);
-	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB, true);
+	SetMultiXactIdLimit(checkPoint.oldestMulti, checkPoint.oldestMultiDB);
 	SetCommitTsLimit(checkPoint.oldestCommitTsXid,
 					 checkPoint.newestCommitTsXid);
 
@@ -5929,7 +5944,7 @@ StartupXLOG(void)
 	 */
 	if (InRecovery &&
 		(EndOfLog < LocalMinRecoveryPoint ||
-		 !XLogRecPtrIsInvalid(ControlFile->backupStartPoint)))
+		 XLogRecPtrIsValid(ControlFile->backupStartPoint)))
 	{
 		/*
 		 * Ran off end of WAL before reaching end-of-backup WAL record, or
@@ -5939,7 +5954,7 @@ StartupXLOG(void)
 		 */
 		if (ArchiveRecoveryRequested || ControlFile->backupEndRequired)
 		{
-			if (!XLogRecPtrIsInvalid(ControlFile->backupStartPoint) || ControlFile->backupEndRequired)
+			if (XLogRecPtrIsValid(ControlFile->backupStartPoint) || ControlFile->backupEndRequired)
 				ereport(FATAL,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("WAL ends before end of online backup"),
@@ -6041,7 +6056,7 @@ StartupXLOG(void)
 	 * (It's critical to first write an OVERWRITE_CONTRECORD message, which
 	 * we'll do as soon as we're open for writing new WAL.)
 	 */
-	if (!XLogRecPtrIsInvalid(missingContrecPtr))
+	if (XLogRecPtrIsValid(missingContrecPtr))
 	{
 		/*
 		 * We should only have a missingContrecPtr if we're not switching to a
@@ -6051,7 +6066,7 @@ StartupXLOG(void)
 		 * disregard.
 		 */
 		Assert(newTLI == endOfRecoveryInfo->lastRecTLI);
-		Assert(!XLogRecPtrIsInvalid(abortedRecPtr));
+		Assert(XLogRecPtrIsValid(abortedRecPtr));
 		EndOfLog = missingContrecPtr;
 	}
 
@@ -6155,9 +6170,9 @@ StartupXLOG(void)
 	LocalSetXLogInsertAllowed();
 
 	/* If necessary, write overwrite-contrecord before doing anything else */
-	if (!XLogRecPtrIsInvalid(abortedRecPtr))
+	if (XLogRecPtrIsValid(abortedRecPtr))
 	{
-		Assert(!XLogRecPtrIsInvalid(missingContrecPtr));
+		Assert(XLogRecPtrIsValid(missingContrecPtr));
 		CreateOverwriteContrecordRecord(abortedRecPtr, missingContrecPtr, newTLI);
 	}
 
@@ -6221,6 +6236,12 @@ StartupXLOG(void)
 
 	UpdateControlFile();
 	LWLockRelease(ControlFileLock);
+
+	/*
+	 * Wake up all waiters for replay LSN.  They need to report an error that
+	 * recovery was ended before reaching the target LSN.
+	 */
+	WaitLSNWakeup(WAIT_LSN_TYPE_REPLAY, InvalidXLogRecPtr);
 
 	/*
 	 * Shutdown the recovery environment.  This must occur after
@@ -7351,7 +7372,7 @@ CreateCheckPoint(int flags)
 	 * Update the average distance between checkpoints if the prior checkpoint
 	 * exists.
 	 */
-	if (PriorRedoPtr != InvalidXLogRecPtr)
+	if (XLogRecPtrIsValid(PriorRedoPtr))
 		UpdateCheckPointDistanceEstimate(RedoRecPtr - PriorRedoPtr);
 
 	INJECTION_POINT("checkpoint-before-old-wal-removal", NULL);
@@ -7681,7 +7702,7 @@ CreateRestartPoint(int flags)
 	 * restartpoint. It's assumed that flushing the buffers will do that as a
 	 * side-effect.
 	 */
-	if (XLogRecPtrIsInvalid(lastCheckPointRecPtr) ||
+	if (!XLogRecPtrIsValid(lastCheckPointRecPtr) ||
 		lastCheckPoint.redo <= ControlFile->checkPointCopy.redo)
 	{
 		ereport(DEBUG2,
@@ -7799,7 +7820,7 @@ CreateRestartPoint(int flags)
 	 * Update the average distance between checkpoints/restartpoints if the
 	 * prior checkpoint exists.
 	 */
-	if (PriorRedoPtr != InvalidXLogRecPtr)
+	if (XLogRecPtrIsValid(PriorRedoPtr))
 		UpdateCheckPointDistanceEstimate(RedoRecPtr - PriorRedoPtr);
 
 	/*
@@ -7924,7 +7945,7 @@ GetWALAvailability(XLogRecPtr targetLSN)
 	/*
 	 * slot does not reserve WAL. Either deactivated, or has never been active
 	 */
-	if (XLogRecPtrIsInvalid(targetLSN))
+	if (!XLogRecPtrIsValid(targetLSN))
 		return WALAVAIL_INVALID_LSN;
 
 	/*
@@ -8006,7 +8027,7 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 
 	/* Calculate how many segments are kept by slots. */
 	keep = XLogGetReplicationSlotMinimumLSN();
-	if (keep != InvalidXLogRecPtr && keep < recptr)
+	if (XLogRecPtrIsValid(keep) && keep < recptr)
 	{
 		XLByteToSeg(keep, segno, wal_segment_size);
 
@@ -8033,7 +8054,7 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 	 * summarized.
 	 */
 	keep = GetOldestUnsummarizedLSN(NULL, NULL);
-	if (keep != InvalidXLogRecPtr)
+	if (XLogRecPtrIsValid(keep))
 	{
 		XLogSegNo	unsummarized_segno;
 
@@ -8340,8 +8361,8 @@ xlog_redo(XLogReaderState *record)
 		 * never arrive.
 		 */
 		if (ArchiveRecoveryRequested &&
-			!XLogRecPtrIsInvalid(ControlFile->backupStartPoint) &&
-			XLogRecPtrIsInvalid(ControlFile->backupEndPoint))
+			XLogRecPtrIsValid(ControlFile->backupStartPoint) &&
+			!XLogRecPtrIsValid(ControlFile->backupEndPoint))
 			ereport(PANIC,
 					(errmsg("online backup was canceled, recovery cannot continue")));
 
@@ -8591,7 +8612,7 @@ xlog_redo(XLogReaderState *record)
 			LocalMinRecoveryPoint = ControlFile->minRecoveryPoint;
 			LocalMinRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
 		}
-		if (LocalMinRecoveryPoint != InvalidXLogRecPtr && LocalMinRecoveryPoint < lsn)
+		if (XLogRecPtrIsValid(LocalMinRecoveryPoint) && LocalMinRecoveryPoint < lsn)
 		{
 			TimeLineID	replayTLI;
 
@@ -9112,7 +9133,7 @@ do_pg_backup_start(const char *backupidstr, bool fast, List **tablespaces,
 				continue;
 			}
 
-			ti = palloc(sizeof(tablespaceinfo));
+			ti = palloc_object(tablespaceinfo);
 			ti->oid = tsoid;
 			ti->path = pstrdup(linkpath);
 			ti->rpath = relpath;
@@ -9513,11 +9534,10 @@ GetOldestRestartPoint(XLogRecPtr *oldrecptr, TimeLineID *oldtli)
 void
 XLogShutdownWalRcv(void)
 {
-	ShutdownWalRcv();
+	Assert(AmStartupProcess() || !IsUnderPostmaster);
 
-	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-	XLogCtl->InstallXLogFileSegmentActive = false;
-	LWLockRelease(ControlFileLock);
+	ShutdownWalRcv();
+	ResetInstallXLogFileSegmentActive();
 }
 
 /* Enable WAL file recycling and preallocation. */
@@ -9526,6 +9546,15 @@ SetInstallXLogFileSegmentActive(void)
 {
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	XLogCtl->InstallXLogFileSegmentActive = true;
+	LWLockRelease(ControlFileLock);
+}
+
+/* Disable WAL file recycling and preallocation. */
+void
+ResetInstallXLogFileSegmentActive(void)
+{
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	XLogCtl->InstallXLogFileSegmentActive = false;
 	LWLockRelease(ControlFileLock);
 }
 

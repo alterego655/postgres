@@ -1742,6 +1742,9 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 			   false,			/* Type NOT NULL */
 			   InvalidOid);		/* typcollation */
 
+	/* Ensure these new types are visible to ProcedureCreate */
+	CommandCounterIncrement();
+
 	/* And create the constructor functions for this range type */
 	makeRangeConstructors(typeName, typeNamespace, typoid, rangeSubtype);
 	makeMultirangeConstructors(multirangeTypeName, typeNamespace,
@@ -1764,7 +1767,7 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
  * impossible to define a polymorphic constructor; we have to generate new
  * constructor functions explicitly for each range type.
  *
- * We actually define 4 functions, with 0 through 3 arguments.  This is just
+ * We actually define 2 functions, with 2 through 3 arguments.  This is just
  * to offer more convenience for the user.
  */
 static void
@@ -3248,7 +3251,6 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmod
 				Datum		d;
 				bool		isNull;
 				Datum		conResult;
-				Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
 
 				d = slot_getattr(slot, attnum, &isNull);
 
@@ -3261,6 +3263,8 @@ validateDomainCheckConstraint(Oid domainoid, const char *ccbin, LOCKMODE lockmod
 
 				if (!isNull && !DatumGetBool(conResult))
 				{
+					Form_pg_attribute attr = TupleDescAttr(tupdesc, attnum - 1);
+
 					/*
 					 * In principle the auxiliary information for this error
 					 * should be errdomainconstraint(), but errtablecol()
@@ -3443,10 +3447,10 @@ get_rels_with_domain(Oid domainOid, LOCKMODE lockmode)
 			}
 
 			/* Build the RelToCheck entry with enough space for all atts */
-			rtc = (RelToCheck *) palloc(sizeof(RelToCheck));
+			rtc = palloc_object(RelToCheck);
 			rtc->rel = rel;
 			rtc->natts = 0;
-			rtc->atts = (int *) palloc(sizeof(int) * RelationGetNumberOfAttributes(rel));
+			rtc->atts = palloc_array(int, RelationGetNumberOfAttributes(rel));
 			result = lappend(result, rtc);
 		}
 

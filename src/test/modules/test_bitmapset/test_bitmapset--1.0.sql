@@ -68,7 +68,7 @@ CREATE FUNCTION test_bms_singleton_member(text)
 RETURNS integer STRICT
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE FUNCTION test_bms_get_singleton_member(text, integer)
+CREATE FUNCTION test_bms_get_singleton_member(text)
 RETURNS integer
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
@@ -109,6 +109,10 @@ RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
 CREATE FUNCTION test_bms_int_members(text, text)
+RETURNS text
+AS 'MODULE_PATHNAME' LANGUAGE C;
+
+CREATE FUNCTION test_bms_del_members(text, text)
 RETURNS text
 AS 'MODULE_PATHNAME' LANGUAGE C;
 

@@ -868,7 +868,7 @@ SpGistGetLeafTupleSize(TupleDesc tupleDescriptor,
  * Construct a leaf tuple containing the given heap TID and datum values
  */
 SpGistLeafTuple
-spgFormLeafTuple(SpGistState *state, ItemPointer heapPtr,
+spgFormLeafTuple(SpGistState *state, const ItemPointerData *heapPtr,
 				 const Datum *datums, const bool *isnulls)
 {
 	SpGistLeafTuple tup;
@@ -1177,7 +1177,7 @@ spgExtractNodeLabels(SpGistState *state, SpGistInnerTuple innerTuple)
 	}
 	else
 	{
-		nodeLabels = (Datum *) palloc(sizeof(Datum) * innerTuple->nNodes);
+		nodeLabels = palloc_array(Datum, innerTuple->nNodes);
 		SGITITERATE(innerTuple, i, node)
 		{
 			if (IndexTupleHasNulls(node))
@@ -1200,7 +1200,7 @@ spgExtractNodeLabels(SpGistState *state, SpGistInnerTuple innerTuple)
  * rather than returning InvalidOffsetNumber.
  */
 OffsetNumber
-SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
+SpGistPageAddNewItem(SpGistState *state, Page page, const void *item, Size size,
 					 OffsetNumber *startOffset, bool errorOK)
 {
 	SpGistPageOpaque opaque = SpGistPageGetOpaque(page);

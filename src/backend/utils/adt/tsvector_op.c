@@ -75,7 +75,7 @@ static bool TS_execute_locations_recurse(QueryItem *curitem,
 										 void *arg,
 										 TSExecuteCallback chkcond,
 										 List **locations);
-static int	tsvector_bsearch(const TSVector tsv, char *lexeme, int lexeme_len);
+static int	tsvector_bsearch(const TSVectorData *tsv, char *lexeme, int lexeme_len);
 static Datum tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column);
 
 
@@ -83,7 +83,7 @@ static Datum tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column);
  * Order: haspos, len, word, for all positions (pos, weight)
  */
 static int
-silly_cmp_tsvector(const TSVector a, const TSVector b)
+silly_cmp_tsvector(const TSVectorData *a, const TSVectorData *b)
 {
 	if (VARSIZE(a) < VARSIZE(b))
 		return -1;
@@ -95,8 +95,8 @@ silly_cmp_tsvector(const TSVector a, const TSVector b)
 		return 1;
 	else
 	{
-		WordEntry  *aptr = ARRPTR(a);
-		WordEntry  *bptr = ARRPTR(b);
+		const WordEntry *aptr = ARRPTR(a);
+		const WordEntry *bptr = ARRPTR(b);
 		int			i = 0;
 		int			res;
 
@@ -397,9 +397,9 @@ add_pos(TSVector src, WordEntry *srcptr,
  * found.
  */
 static int
-tsvector_bsearch(const TSVector tsv, char *lexeme, int lexeme_len)
+tsvector_bsearch(const TSVectorData *tsv, char *lexeme, int lexeme_len)
 {
-	WordEntry  *arrin = ARRPTR(tsv);
+	const WordEntry *arrin = ARRPTR(tsv);
 	int			StopLow = 0,
 				StopHigh = tsv->size,
 				StopMiddle,
@@ -1212,7 +1212,7 @@ checkclass_str(CHKVAL *chkval, WordEntry *entry, QueryOperand *val,
 			/*
 			 * Filter position information by weights
 			 */
-			dptr = data->pos = palloc(sizeof(WordEntryPos) * posvec->npos);
+			dptr = data->pos = palloc_array(WordEntryPos, posvec->npos);
 			data->allocated = true;
 
 			/* Is there a position with a matching weight? */
@@ -1391,12 +1391,12 @@ checkcondition_str(void *checkval, QueryOperand *val, ExecPhraseData *data)
 						if (totalpos == 0)
 						{
 							totalpos = 256;
-							allpos = palloc(sizeof(WordEntryPos) * totalpos);
+							allpos = palloc_array(WordEntryPos, totalpos);
 						}
 						else
 						{
 							totalpos *= 2;
-							allpos = repalloc(allpos, sizeof(WordEntryPos) * totalpos);
+							allpos = repalloc_array(allpos, WordEntryPos, totalpos);
 						}
 					}
 
@@ -2456,7 +2456,7 @@ ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-	stat->stack = palloc0(sizeof(StatEntry *) * (stat->maxdepth + 1));
+	stat->stack = palloc0_array(StatEntry *, stat->maxdepth + 1);
 	stat->stackpos = 0;
 
 	node = stat->root;
@@ -2839,7 +2839,7 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 	prs.lenwords = 32;
 	prs.curwords = 0;
 	prs.pos = 0;
-	prs.words = (ParsedWord *) palloc(sizeof(ParsedWord) * prs.lenwords);
+	prs.words = palloc_array(ParsedWord, prs.lenwords);
 
 	/* find all words in indexable column(s) */
 	for (i = 2; i < trigger->tgnargs; i++)

@@ -60,7 +60,12 @@ PLy_procedure_name(PLyProcedure *proc)
  *
  * The reason that both fn_rel and is_trigger need to be passed is that when
  * trigger functions get validated we don't know which relation(s) they'll
- * be used with, so no sensible fn_rel can be passed.
+ * be used with, so no sensible fn_rel can be passed.  Also, in that case
+ * we can't make a cache entry because we can't construct the right cache key.
+ * To forestall leakage of the PLyProcedure in such cases, delete it after
+ * construction and return NULL.  That's okay because the only caller that
+ * would pass that set of values is plpython3_validator, which ignores our
+ * result anyway.
  */
 PLyProcedure *
 PLy_procedure_get(Oid fn_oid, Oid fn_rel, PLyTrigType is_trigger)
@@ -102,6 +107,12 @@ PLy_procedure_get(Oid fn_oid, Oid fn_rel, PLyTrigType is_trigger)
 			proc = PLy_procedure_create(procTup, fn_oid, is_trigger);
 			if (use_cache)
 				entry->proc = proc;
+			else
+			{
+				/* Delete the proc, otherwise it's a memory leak */
+				PLy_procedure_delete(proc);
+				proc = NULL;
+			}
 		}
 		else if (!PLy_procedure_valid(proc, procTup))
 		{
@@ -166,7 +177,7 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, PLyTrigType is_trigger)
 
 	oldcxt = MemoryContextSwitchTo(cxt);
 
-	proc = (PLyProcedure *) palloc0(sizeof(PLyProcedure));
+	proc = palloc0_object(PLyProcedure);
 	proc->mcxt = cxt;
 
 	PG_TRY();
@@ -282,8 +293,8 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, PLyTrigType is_trigger)
 			}
 
 			/* Allocate arrays for per-input-argument data */
-			proc->argnames = (char **) palloc0(sizeof(char *) * proc->nargs);
-			proc->args = (PLyDatumToOb *) palloc0(sizeof(PLyDatumToOb) * proc->nargs);
+			proc->argnames = (char **) palloc0_array(char *, proc->nargs);
+			proc->args = (PLyDatumToOb *) palloc0_array(PLyDatumToOb, proc->nargs);
 
 			for (i = pos = 0; i < total; i++)
 			{

@@ -2375,7 +2375,7 @@ order by t1.unique1;
  Sort
    Sort Key: t1.unique1
    ->  Hash Join
-         Hash Cond: ((t1.two = t2.two) AND (t1.unique1 = (SubPlan 2)))
+         Hash Cond: ((t1.two = t2.two) AND (t1.unique1 = (SubPlan expr_1)))
          ->  Bitmap Heap Scan on tenk1 t1
                Recheck Cond: (unique1 < 10)
                ->  Bitmap Index Scan on tenk1_unique1
@@ -2385,10 +2385,10 @@ order by t1.unique1;
                      Recheck Cond: (unique1 < 10)
                      ->  Bitmap Index Scan on tenk1_unique1
                            Index Cond: (unique1 < 10)
-               SubPlan 2
+               SubPlan expr_1
                  ->  Result
                        Replaces: MinMaxAggregate
-                       InitPlan 1
+                       InitPlan minmax_1
                          ->  Limit
                                ->  Index Only Scan using tenk1_unique1 on tenk1
                                      Index Cond: ((unique1 IS NOT NULL) AND (unique1 = t2.unique1))
@@ -2840,20 +2840,22 @@ select x.thousand, x.twothousand, count(*)
 from tenk1 x inner join tenk1 y on x.thousand = y.thousand
 group by x.thousand, x.twothousand
 order by x.thousand desc, x.twothousand;
-                                    QUERY PLAN                                    
-----------------------------------------------------------------------------------
- GroupAggregate
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Finalize GroupAggregate
    Group Key: x.thousand, x.twothousand
    ->  Incremental Sort
          Sort Key: x.thousand DESC, x.twothousand
          Presorted Key: x.thousand
          ->  Merge Join
                Merge Cond: (y.thousand = x.thousand)
-               ->  Index Only Scan Backward using tenk1_thous_tenthous on tenk1 y
+               ->  Partial GroupAggregate
+                     Group Key: y.thousand
+                     ->  Index Only Scan Backward using tenk1_thous_tenthous on tenk1 y
                ->  Sort
                      Sort Key: x.thousand DESC
                      ->  Seq Scan on tenk1 x
-(11 rows)
+(13 rows)
 
 reset enable_hashagg;
 reset enable_nestloop;
@@ -3079,6 +3081,33 @@ select * from tbl_rs t1 join
 (6 rows)
 
 --
+-- regression test for bug with parallel-hash-right-semi join
+--
+begin;
+-- encourage use of parallel plans
+set local parallel_setup_cost=0;
+set local parallel_tuple_cost=0;
+set local min_parallel_table_scan_size=0;
+set local max_parallel_workers_per_gather=4;
+-- ensure we don't get parallel hash right semi join
+explain (costs off)
+select * from tenk1 t1
+where exists (select 1 from tenk1 t2 where fivethous = t1.fivethous)
+and t1.fivethous < 5;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Gather
+   Workers Planned: 4
+   ->  Parallel Hash Semi Join
+         Hash Cond: (t1.fivethous = t2.fivethous)
+         ->  Parallel Seq Scan on tenk1 t1
+               Filter: (fivethous < 5)
+         ->  Parallel Hash
+               ->  Parallel Seq Scan on tenk1 t2
+(8 rows)
+
+rollback;
+--
 -- regression test for bug #13908 (hash join with skew tuples & nbatch increase)
 --
 set work_mem to '64kB';
@@ -3181,11 +3210,11 @@ where unique1 in (select unique2 from tenk1 b);
 explain (costs off)
 select a.* from tenk1 a
 where unique1 not in (select unique2 from tenk1 b);
-                        QUERY PLAN                         
------------------------------------------------------------
+                          QUERY PLAN                           
+---------------------------------------------------------------
  Seq Scan on tenk1 a
-   Filter: (NOT (ANY (unique1 = (hashed SubPlan 1).col1)))
-   SubPlan 1
+   Filter: (NOT (ANY (unique1 = (hashed SubPlan any_1).col1)))
+   SubPlan any_1
      ->  Index Only Scan using tenk1_unique2 on tenk1 b
 (4 rows)
 
@@ -3706,11 +3735,11 @@ order by 1,2;
    Sort Key: t1.q1, t1.q2
    ->  Hash Left Join
          Hash Cond: (t1.q2 = t2.q1)
-         Filter: (1 = (SubPlan 1))
+         Filter: (1 = (SubPlan expr_1))
          ->  Seq Scan on int8_tbl t1
          ->  Hash
                ->  Seq Scan on int8_tbl t2
-         SubPlan 1
+         SubPlan expr_1
            ->  Limit
                  ->  Result
                        One-Time Filter: ((42) IS NOT NULL)
@@ -4225,14 +4254,14 @@ from int8_tbl i8
   right join (select false as z) ss3 on true,
   lateral (select i8.q2 as q2l where x limit 1) ss4
 where i8.q2 = 123;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Nested Loop
-   Output: i8.q1, i8.q2, (InitPlan 1).col1, false, (i8.q2)
-   InitPlan 1
+   Output: i8.q1, i8.q2, (InitPlan expr_1).col1, false, (i8.q2)
+   InitPlan expr_1
      ->  Result
            Output: true
-   InitPlan 2
+   InitPlan expr_2
      ->  Result
            Output: true
    ->  Seq Scan on public.int4_tbl i4
@@ -4241,7 +4270,7 @@ where i8.q2 = 123;
    ->  Nested Loop
          Output: i8.q1, i8.q2, (i8.q2)
          ->  Subquery Scan on ss1
-               Output: ss1.y, (InitPlan 1).col1
+               Output: ss1.y, (InitPlan expr_1).col1
                ->  Limit
                      Output: NULL::integer
                      ->  Result
@@ -4255,7 +4284,7 @@ where i8.q2 = 123;
                      Output: (i8.q2)
                      ->  Result
                            Output: i8.q2
-                           One-Time Filter: ((InitPlan 1).col1)
+                           One-Time Filter: ((InitPlan expr_1).col1)
 (29 rows)
 
 explain (verbose, costs off)
@@ -4268,14 +4297,14 @@ from int8_tbl i8
   right join (select false as z) ss3 on true,
   lateral (select i8.q2 as q2l where x limit 1) ss4
 where i8.q2 = 123;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Nested Loop
-   Output: i8.q1, i8.q2, (InitPlan 1).col1, false, (i8.q2)
-   InitPlan 1
+   Output: i8.q1, i8.q2, (InitPlan expr_1).col1, false, (i8.q2)
+   InitPlan expr_1
      ->  Result
            Output: true
-   InitPlan 2
+   InitPlan expr_2
      ->  Result
            Output: true
    ->  Limit
@@ -4285,7 +4314,7 @@ where i8.q2 = 123;
    ->  Nested Loop
          Output: i8.q1, i8.q2, (i8.q2)
          ->  Seq Scan on public.int4_tbl i4
-               Output: i4.f1, (InitPlan 1).col1
+               Output: i4.f1, (InitPlan expr_1).col1
                Filter: (i4.f1 = 0)
          ->  Nested Loop
                Output: i8.q1, i8.q2, (i8.q2)
@@ -4296,7 +4325,7 @@ where i8.q2 = 123;
                      Output: (i8.q2)
                      ->  Result
                            Output: i8.q2
-                           One-Time Filter: ((InitPlan 1).col1)
+                           One-Time Filter: ((InitPlan expr_1).col1)
 (27 rows)
 
 -- Test proper handling of appendrel PHVs during useless-RTE removal
@@ -5757,13 +5786,13 @@ explain (costs off)
 select a.unique1, b.unique2
   from onek a left join onek b on a.unique1 = b.unique2
   where (b.unique2, random() > 0) = any (select q1, random() > 0 from int8_tbl c where c.q1 < b.unique1);
-                                                    QUERY PLAN                                                    
-------------------------------------------------------------------------------------------------------------------
+                                                        QUERY PLAN                                                        
+--------------------------------------------------------------------------------------------------------------------------
  Hash Join
    Hash Cond: (b.unique2 = a.unique1)
    ->  Seq Scan on onek b
-         Filter: (ANY ((unique2 = (SubPlan 1).col1) AND ((random() > '0'::double precision) = (SubPlan 1).col2)))
-         SubPlan 1
+         Filter: (ANY ((unique2 = (SubPlan any_1).col1) AND ((random() > '0'::double precision) = (SubPlan any_1).col2)))
+         SubPlan any_1
            ->  Seq Scan on int8_tbl c
                  Filter: (q1 < b.unique1)
    ->  Hash
@@ -6105,7 +6134,7 @@ select exists(
                              QUERY PLAN                              
 ---------------------------------------------------------------------
  Seq Scan on int4_tbl x0
-   SubPlan 1
+   SubPlan exists_1
      ->  Nested Loop Left Join
            Join Filter: (t2.q2 = t4.q2)
            ->  Nested Loop Left Join
@@ -6127,6 +6156,40 @@ select exists(
 explain (costs off)
 select d.* from d left join (select * from b group by b.id, b.c_id) s
   on d.a = s.id and d.b = s.c_id;
+  QUERY PLAN   
+---------------
+ Seq Scan on d
+(1 row)
+
+-- check that join removal works for a left join when joining a subquery
+-- that is guaranteed to be unique by GROUPING SETS
+explain (costs off)
+select d.* from d left join (select 1 as x from b group by ()) s
+  on d.a = s.x;
+  QUERY PLAN   
+---------------
+ Seq Scan on d
+(1 row)
+
+explain (costs off)
+select d.* from d left join (select 1 as x from b group by grouping sets(())) s
+  on d.a = s.x;
+  QUERY PLAN   
+---------------
+ Seq Scan on d
+(1 row)
+
+explain (costs off)
+select d.* from d left join (select 1 as x from b group by grouping sets(()), grouping sets(())) s
+  on d.a = s.x;
+  QUERY PLAN   
+---------------
+ Seq Scan on d
+(1 row)
+
+explain (costs off)
+select d.* from d left join (select 1 as x from b group by distinct grouping sets((), ())) s
+  on d.a = s.x;
   QUERY PLAN   
 ---------------
  Seq Scan on d
@@ -6159,6 +6222,55 @@ select d.* from d left join (select * from b group by b.id, b.c_id) s
          Sort Key: d.a
          ->  Seq Scan on d
 (8 rows)
+
+-- join removal is not possible when the GROUP BY contains non-empty grouping
+-- sets or multiple empty grouping sets
+explain (costs off)
+select d.* from d left join (select 1 as x from b group by rollup(x)) s
+  on d.a = s.x;
+           QUERY PLAN            
+---------------------------------
+ Hash Left Join
+   Hash Cond: (d.a = (1))
+   ->  Seq Scan on d
+   ->  Hash
+         ->  MixedAggregate
+               Hash Key: 1
+               Group Key: ()
+               ->  Seq Scan on b
+(8 rows)
+
+explain (costs off)
+select d.* from d left join (select 1 as x from b group by grouping sets((), ())) s
+  on d.a = s.x;
+               QUERY PLAN                
+-----------------------------------------
+ Hash Left Join
+   Hash Cond: (d.a = (1))
+   ->  Seq Scan on d
+   ->  Hash
+         ->  Append
+               ->  Result
+                     Replaces: Aggregate
+               ->  Result
+                     Replaces: Aggregate
+(9 rows)
+
+explain (costs off)
+select d.* from d left join (select 1 as x from b group by grouping sets((), grouping sets(()))) s
+  on d.a = s.x;
+               QUERY PLAN                
+-----------------------------------------
+ Hash Left Join
+   Hash Cond: (d.a = (1))
+   ->  Seq Scan on d
+   ->  Hash
+         ->  Append
+               ->  Result
+                     Replaces: Aggregate
+               ->  Result
+                     Replaces: Aggregate
+(9 rows)
 
 -- similarly, but keying off a DISTINCT clause
 explain (costs off)
@@ -6956,7 +7068,7 @@ where t1.a = t2.a;
 ------------------------------------------
  Seq Scan on sj t2
    Filter: (a IS NOT NULL)
-   SubPlan 1
+   SubPlan expr_1
      ->  Result
            One-Time Filter: (t2.a = t2.a)
            ->  Seq Scan on sj
@@ -8983,8 +9095,8 @@ lateral (select * from int8_tbl t1,
                                      where q2 = (select greatest(t1.q1,t2.q2))
                                        and (select v.id=0)) offset 0) ss2) ss
          where t1.q1 = ss.q2) ss0;
-                                                         QUERY PLAN                                                         
-----------------------------------------------------------------------------------------------------------------------------
+                                                             QUERY PLAN                                                             
+------------------------------------------------------------------------------------------------------------------------------------
  Nested Loop
    Output: "*VALUES*".column1, t1.q1, t1.q2, ss2.q1, ss2.q2
    ->  Seq Scan on public.int8_tbl t1
@@ -8998,20 +9110,20 @@ lateral (select * from int8_tbl t1,
                Filter: (t1.q1 = ss2.q2)
                ->  Seq Scan on public.int8_tbl t2
                      Output: t2.q1, t2.q2
-                     Filter: (ANY ((t2.q1 = (SubPlan 3).col1) AND ((random() > '0'::double precision) = (SubPlan 3).col2)))
-                     SubPlan 3
+                     Filter: (ANY ((t2.q1 = (SubPlan any_1).col1) AND ((random() > '0'::double precision) = (SubPlan any_1).col2)))
+                     SubPlan any_1
                        ->  Result
                              Output: t3.q2, (random() > '0'::double precision)
-                             One-Time Filter: (InitPlan 2).col1
-                             InitPlan 1
+                             One-Time Filter: (InitPlan expr_2).col1
+                             InitPlan expr_1
                                ->  Result
                                      Output: GREATEST(t1.q1, t2.q2)
-                             InitPlan 2
+                             InitPlan expr_2
                                ->  Result
                                      Output: ("*VALUES*".column1 = 0)
                              ->  Seq Scan on public.int8_tbl t3
                                    Output: t3.q1, t3.q2
-                                   Filter: (t3.q2 = (InitPlan 1).col1)
+                                   Filter: (t3.q2 = (InitPlan expr_1).col1)
 (27 rows)
 
 select * from (values (0), (1)) v(id),
@@ -9518,7 +9630,7 @@ left join j2 on j1.id1 = j2.id1 where j1.id2 = 1;
          Output: j2.id1, j2.id2
 (8 rows)
 
-create unique index j1_id2_idx on j1(id2) where id2 is not null;
+create unique index j1_id2_idx on j1(id2) where id2 > 0;
 -- ensure we don't use a partial unique index as unique proofs
 explain (verbose, costs off)
 select * from j1
@@ -9723,13 +9835,13 @@ SELECT * FROM rescan_bhs t1 LEFT JOIN rescan_bhs t2 ON t1.a IN
                         QUERY PLAN                         
 -----------------------------------------------------------
  Nested Loop Left Join
-   Join Filter: (ANY (t1.a = (SubPlan 1).col1))
+   Join Filter: (ANY (t1.a = (SubPlan any_1).col1))
    ->  Bitmap Heap Scan on rescan_bhs t1
          ->  Bitmap Index Scan on rescan_bhs_a_idx
    ->  Materialize
          ->  Bitmap Heap Scan on rescan_bhs t2
                ->  Bitmap Index Scan on rescan_bhs_a_idx
-   SubPlan 1
+   SubPlan any_1
      ->  Result
            One-Time Filter: (t2.a > 1)
            ->  Bitmap Heap Scan on rescan_bhs t3

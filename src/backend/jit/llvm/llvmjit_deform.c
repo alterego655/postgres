@@ -156,12 +156,12 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 
 	b = LLVMCreateBuilderInContext(lc);
 
-	attcheckattnoblocks = palloc(sizeof(LLVMBasicBlockRef) * natts);
-	attstartblocks = palloc(sizeof(LLVMBasicBlockRef) * natts);
-	attisnullblocks = palloc(sizeof(LLVMBasicBlockRef) * natts);
-	attcheckalignblocks = palloc(sizeof(LLVMBasicBlockRef) * natts);
-	attalignblocks = palloc(sizeof(LLVMBasicBlockRef) * natts);
-	attstoreblocks = palloc(sizeof(LLVMBasicBlockRef) * natts);
+	attcheckattnoblocks = palloc_array(LLVMBasicBlockRef, natts);
+	attstartblocks = palloc_array(LLVMBasicBlockRef, natts);
+	attisnullblocks = palloc_array(LLVMBasicBlockRef, natts);
+	attcheckalignblocks = palloc_array(LLVMBasicBlockRef, natts);
+	attalignblocks = palloc_array(LLVMBasicBlockRef, natts);
+	attstoreblocks = palloc_array(LLVMBasicBlockRef, natts);
 
 	known_alignment = 0;
 
@@ -663,7 +663,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 			v_tmp_loaddata =
 				LLVMBuildPointerCast(b, v_attdatap, vartypep, "");
 			v_tmp_loaddata = l_load(b, vartype, v_tmp_loaddata, "attr_byval");
-			v_tmp_loaddata = LLVMBuildZExt(b, v_tmp_loaddata, TypeDatum, "");
+			v_tmp_loaddata = LLVMBuildSExt(b, v_tmp_loaddata, TypeDatum, "");
 
 			LLVMBuildStore(b, v_tmp_loaddata, v_resultp);
 		}

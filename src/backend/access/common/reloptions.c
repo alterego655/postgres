@@ -322,8 +322,17 @@ static relopt_int intRelOpts[] =
 	{
 		{
 			"log_autovacuum_min_duration",
-			"Sets the minimum execution time above which autovacuum actions will be logged",
+			"Sets the minimum execution time above which vacuum actions by autovacuum will be logged",
 			RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+			ShareUpdateExclusiveLock
+		},
+		-1, -1, INT_MAX
+	},
+	{
+		{
+			"log_autoanalyze_min_duration",
+			"Sets the minimum execution time above which analyze actions by autovacuum will be logged",
+			RELOPT_KIND_HEAP,
 			ShareUpdateExclusiveLock
 		},
 		-1, -1, INT_MAX
@@ -767,7 +776,7 @@ register_reloptions_validator(local_relopts *relopts, relopts_validator validato
 static void
 add_local_reloption(local_relopts *relopts, relopt_gen *newoption, int offset)
 {
-	local_relopt *opt = palloc(sizeof(*opt));
+	local_relopt *opt = palloc_object(local_relopt);
 
 	Assert(offset < relopts->relopt_struct_size);
 
@@ -1561,7 +1570,7 @@ static relopt_value *
 parseLocalRelOptions(local_relopts *relopts, Datum options, bool validate)
 {
 	int			nopts = list_length(relopts->options);
-	relopt_value *values = palloc(sizeof(*values) * nopts);
+	relopt_value *values = palloc_array(relopt_value, nopts);
 	ListCell   *lc;
 	int			i = 0;
 
@@ -1895,7 +1904,9 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"autovacuum_multixact_freeze_table_age", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, multixact_freeze_table_age)},
 		{"log_autovacuum_min_duration", RELOPT_TYPE_INT,
-		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, log_min_duration)},
+		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, log_vacuum_min_duration)},
+		{"log_autoanalyze_min_duration", RELOPT_TYPE_INT,
+		offsetof(StdRdOptions, autovacuum) + offsetof(AutoVacOpts, log_analyze_min_duration)},
 		{"toast_tuple_target", RELOPT_TYPE_INT,
 		offsetof(StdRdOptions, toast_tuple_target)},
 		{"autovacuum_vacuum_cost_delay", RELOPT_TYPE_REAL,
@@ -1980,7 +1991,7 @@ void *
 build_local_reloptions(local_relopts *relopts, Datum options, bool validate)
 {
 	int			noptions = list_length(relopts->options);
-	relopt_parse_elt *elems = palloc(sizeof(*elems) * noptions);
+	relopt_parse_elt *elems = palloc_array(relopt_parse_elt, noptions);
 	relopt_value *vals;
 	void	   *opts;
 	int			i = 0;

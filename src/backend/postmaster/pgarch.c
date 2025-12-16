@@ -185,8 +185,8 @@ PgArchShmemInit(void)
 /*
  * PgArchCanRestart
  *
- * Return true and archiver is allowed to restart if enough time has
- * passed since it was launched last to reach PGARCH_RESTART_INTERVAL.
+ * Return true, indicating archiver is allowed to restart, if enough time has
+ * passed since it was last launched to reach PGARCH_RESTART_INTERVAL.
  * Otherwise return false.
  *
  * This is a safety valve to protect against continuous respawn attempts if the
@@ -201,15 +201,18 @@ PgArchCanRestart(void)
 	time_t		curtime = time(NULL);
 
 	/*
-	 * Return false and don't restart archiver if too soon since last archiver
-	 * start.
+	 * If first time through, or time somehow went backwards, always update
+	 * last_pgarch_start_time to match the current clock and allow archiver
+	 * start.  Otherwise allow it only once enough time has elapsed.
 	 */
-	if ((unsigned int) (curtime - last_pgarch_start_time) <
-		(unsigned int) PGARCH_RESTART_INTERVAL)
-		return false;
-
-	last_pgarch_start_time = curtime;
-	return true;
+	if (last_pgarch_start_time == 0 ||
+		curtime < last_pgarch_start_time ||
+		curtime - last_pgarch_start_time >= PGARCH_RESTART_INTERVAL)
+	{
+		last_pgarch_start_time = curtime;
+		return true;
+	}
+	return false;
 }
 
 
@@ -254,7 +257,7 @@ PgArchiverMain(const void *startup_data, size_t startup_data_len)
 	PgArch->pgprocno = MyProcNumber;
 
 	/* Create workspace for pgarch_readyXlog() */
-	arch_files = palloc(sizeof(struct arch_files_state));
+	arch_files = palloc_object(struct arch_files_state);
 	arch_files->arch_files_size = 0;
 
 	/* Initialize our max-heap for prioritizing files to archive. */
@@ -332,7 +335,8 @@ pgarch_MainLoop(void)
 		 * SIGUSR2 arrives.  However, that means a random SIGTERM would
 		 * disable archiving indefinitely, which doesn't seem like a good
 		 * idea.  If more than 60 seconds pass since SIGTERM, exit anyway, so
-		 * that the postmaster can start a new archiver if needed.
+		 * that the postmaster can start a new archiver if needed.  Also exit
+		 * if time unexpectedly goes backward.
 		 */
 		if (ShutdownRequestPending)
 		{
@@ -340,8 +344,8 @@ pgarch_MainLoop(void)
 
 			if (last_sigterm_time == 0)
 				last_sigterm_time = curtime;
-			else if ((unsigned int) (curtime - last_sigterm_time) >=
-					 (unsigned int) 60)
+			else if (curtime < last_sigterm_time ||
+					 curtime - last_sigterm_time >= 60)
 				break;
 		}
 
@@ -941,7 +945,7 @@ LoadArchiveLibrary(void)
 		ereport(ERROR,
 				(errmsg("archive modules must register an archive callback")));
 
-	archive_module_state = (ArchiveModuleState *) palloc0(sizeof(ArchiveModuleState));
+	archive_module_state = palloc0_object(ArchiveModuleState);
 	if (ArchiveCallbacks->startup_cb != NULL)
 		ArchiveCallbacks->startup_cb(archive_module_state);
 

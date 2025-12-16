@@ -37,6 +37,7 @@
 #include "catalog/pg_type.h"
 #include "utils/fmgrprotos.h"
 #include "utils/inet.h"
+#include "varatt.h"
 
 
 static int	inet_spg_node_number(const inet *val, int commonbits);
@@ -195,8 +196,8 @@ inet_spg_picksplit(PG_FUNCTION_ARGS)
 
 	/* Don't need labels; allocate output arrays */
 	out->nodeLabels = NULL;
-	out->mapTuplesToNodes = (int *) palloc(sizeof(int) * in->nTuples);
-	out->leafTupleDatums = (Datum *) palloc(sizeof(Datum) * in->nTuples);
+	out->mapTuplesToNodes = palloc_array(int, in->nTuples);
+	out->leafTupleDatums = palloc_array(Datum, in->nTuples);
 
 	if (differentFamilies)
 	{
@@ -300,7 +301,7 @@ inet_spg_inner_consistent(PG_FUNCTION_ARGS)
 
 	if (which)
 	{
-		out->nodeNumbers = (int *) palloc(sizeof(int) * in->nNodes);
+		out->nodeNumbers = palloc_array(int, in->nNodes);
 
 		for (i = 0; i < in->nNodes; i++)
 		{

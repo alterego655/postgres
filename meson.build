@@ -350,6 +350,7 @@ missing = find_program('config/missing', native: true)
 cp = find_program('cp', required: false, native: true)
 xmllint_bin = find_program(get_option('XMLLINT'), native: true, required: false)
 xsltproc_bin = find_program(get_option('XSLTPROC'), native: true, required: false)
+nm = find_program('nm', required: false, native: true)
 
 bison_flags = []
 if bison.found()
@@ -450,6 +451,14 @@ if get_option('segsize_blocks') != 0
   segsize = get_option('segsize_blocks')
 else
   segsize = (get_option('segsize') * 1024 * 1024 * 1024) / blocksize
+endif
+
+# If we don't have largefile support, can't handle segment size >= 2GB.
+if cc.sizeof('off_t', args: test_c_args) < 8
+  segsize_bytes = segsize * blocksize
+  if segsize_bytes >= (2 * 1024 * 1024 * 1024)
+    error('Large file support is not enabled. Segment size cannot be larger than 1GB.')
+  endif
 endif
 
 cdata.set('BLCKSZ', blocksize, description:
@@ -1767,6 +1776,8 @@ cdata.set('SIZEOF_LONG', cc.sizeof('long', args: test_c_args))
 cdata.set('SIZEOF_LONG_LONG', cc.sizeof('long long', args: test_c_args))
 cdata.set('SIZEOF_VOID_P', cc.sizeof('void *', args: test_c_args))
 cdata.set('SIZEOF_SIZE_T', cc.sizeof('size_t', args: test_c_args))
+cdata.set('SIZEOF_INTMAX_T', cc.sizeof('intmax_t', args: test_c_args,
+                                       prefix: '#include <stdint.h>'))
 
 
 # Check if __int128 is a working 128 bit integer type, and if so
@@ -1869,23 +1880,21 @@ if cc.compiles('''
 endif
 
 
-# Check if the C compiler understands _Static_assert(),
-# and define HAVE__STATIC_ASSERT if so.
-#
-# We actually check the syntax ({ _Static_assert(...) }), because we need
-# gcc-style compound expressions to be able to wrap the thing into macros.
+# Check if the C compiler supports GCC-style statement expressions.
 if cc.compiles('''
     int main(int arg, char **argv)
     {
         ({ _Static_assert(1, "foo"); });
     }
     ''',
-    name: '_Static_assert',
+    name: 'statement expressions',
     args: test_c_args)
-  cdata.set('HAVE__STATIC_ASSERT', 1)
+  cdata.set('HAVE_STATEMENT_EXPRESSIONS', 1)
 endif
 
 
+# Select the format archetype to be used to check printf-type functions.
+#
 # Need to check a call with %m because netbsd supports gnu_printf but emits a
 # warning for each use of %m.
 printf_attributes = ['gnu_printf', '__syslog__', 'printf']
@@ -1900,10 +1909,23 @@ attrib_error_args = cc.get_supported_arguments('-Werror=format', '-Werror=ignore
 foreach a : printf_attributes
   if cc.compiles(testsrc.format(a),
       args: test_c_args + attrib_error_args, name: 'format ' + a)
-    cdata.set('PG_PRINTF_ATTRIBUTE', a)
+    cdata.set('PG_C_PRINTF_ATTRIBUTE', a)
     break
   endif
 endforeach
+
+# We need to repeat the test for C++ because gcc and clang prefer different
+# format archetypes.
+if llvm.found()
+  attrib_error_args = cpp.get_supported_arguments('-Werror=format', '-Werror=ignored-attributes')
+  foreach a : printf_attributes
+    if cpp.compiles(testsrc.format(a),
+        args: attrib_error_args, name: 'cppformat ' + a)
+      cdata.set('PG_CXX_PRINTF_ATTRIBUTE', a)
+      break
+    endif
+  endforeach
+endif
 
 
 if cc.has_function_attribute('visibility:default') and \
@@ -2147,13 +2169,20 @@ endforeach
 
 if cc.get_id() == 'msvc'
   cflags_warn += [
-    '/wd4018', # signed/unsigned mismatch
-    '/wd4244', # conversion from 'type1' to 'type2', possible loss of data
-    '/wd4273', # inconsistent DLL linkage
-    '/wd4101', # unreferenced local variable
-    '/wd4102', # unreferenced label
+    # Warnings to disable:
+    # from /W1:
     '/wd4090', # different 'modifier' qualifiers
+    # from /W2:
+    '/wd4244', # conversion from 'type1' to 'type2', possible loss of data
+    # from /W3:
+    '/wd4018', # signed/unsigned mismatch
+    '/wd4101', # unreferenced local variable [like -Wunused-variable, but there is no "unused" attribute, so too noisy]
     '/wd4267', # conversion from 'size_t' to 'type', possible loss of data
+
+    # Additional warnings to enable:
+    '/w24062', # enumerator 'identifier' in switch of enum 'enumeration' is not handled [like -Wswitch]
+    '/w24102', # unreferenced label [like -Wunused-label]
+    '/w24777', # 'function' : format string 'string' requires an argument of type 'type1', but variadic argument number has type 'type2' [like -Wformat]
   ]
 
   cppflags += [
@@ -2613,6 +2642,7 @@ header_checks = [
   'sys/signalfd.h',
   'sys/ucred.h',
   'termios.h',
+  'uchar.h',
   'ucred.h',
   'xlocale.h',
 ]
@@ -2803,13 +2833,12 @@ int main(void)
 endforeach
 
 
-# MSVC doesn't cope well with defining restrict to __restrict, the spelling it
-# understands, because it conflicts with __declspec(restrict). Therefore we
-# define pg_restrict to the appropriate definition, which presumably won't
-# conflict.
-#
-# We assume C99 support, so we don't need to make this conditional.
-cdata.set('pg_restrict', '__restrict')
+# Even though restrict is in C99 and should be supported by all
+# supported compilers, this indirection is useful because __restrict
+# also works in C++ in all supported compilers.  (If not, then we
+# might have to write a real test.)  (restrict is not part of the C++
+# standard.)
+cdata.set('restrict', '__restrict')
 
 
 # Most libraries are included only if they demonstrably provide a function we
@@ -3664,11 +3693,9 @@ foreach test_dir : tests
         '--dbname', dbname,
       ] + t.get('regress_args', [])
 
-      test_selection = []
-      if t.has_key('schedule')
-        test_selection += ['--schedule', t['schedule'],]
-      endif
+      test_schedule = t.get('schedule', [])
 
+      test_selection = []
       if kind == 'isolation'
         test_selection += t.get('specs', [])
       else
@@ -3692,12 +3719,13 @@ foreach test_dir : tests
           testwrap_base,
           '--testgroup', test_group,
           '--testname', kind,
+          '--schedule', test_schedule,
+          '--tests', test_selection,
           '--',
           test_command_base,
           '--outputdir', test_output,
           '--temp-instance', test_output / 'tmp_check',
           '--port', testport.to_string(),
-          test_selection,
         ],
         suite: test_group,
         kwargs: test_kwargs,
@@ -3712,10 +3740,11 @@ foreach test_dir : tests
             testwrap_base,
             '--testgroup', test_group_running,
             '--testname', kind,
+            '--schedule', test_schedule,
+            '--tests', test_selection,
             '--',
             test_command_base,
             '--outputdir', test_output_running,
-            test_selection,
           ],
           is_parallel: t.get('runningcheck-parallel', true),
           suite: test_group_running,

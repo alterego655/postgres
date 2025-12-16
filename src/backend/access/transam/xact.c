@@ -31,6 +31,7 @@
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
+#include "access/xlogwait.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
@@ -663,7 +664,7 @@ AssignTransactionId(TransactionState s)
 		TransactionState *parents;
 		size_t		parentOffset = 0;
 
-		parents = palloc(sizeof(TransactionState) * s->nestingLevel);
+		parents = palloc_array(TransactionState, s->nestingLevel);
 		while (p != NULL && !FullTransactionIdIsValid(p->fullTransactionId))
 		{
 			parents[parentOffset++] = p;
@@ -2842,6 +2843,11 @@ AbortTransaction(void)
 	 * while cleaning up!
 	 */
 	LWLockReleaseAll();
+
+	/*
+	 * Cleanup waiting for LSN if any.
+	 */
+	WaitLSNCleanup();
 
 	/* Clear wait information and command progress indicator */
 	pgstat_report_wait_end();
@@ -5703,9 +5709,9 @@ ShowTransactionStateRec(const char *str, TransactionState s)
 							 s->name ? s->name : "unnamed",
 							 BlockStateAsString(s->blockState),
 							 TransStateAsString(s->state),
-							 (unsigned int) XidFromFullTransactionId(s->fullTransactionId),
-							 (unsigned int) s->subTransactionId,
-							 (unsigned int) currentCommandId,
+							 XidFromFullTransactionId(s->fullTransactionId),
+							 s->subTransactionId,
+							 currentCommandId,
 							 currentCommandIdUsed ? " (used)" : "",
 							 buf.data)));
 	pfree(buf.data);

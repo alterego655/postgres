@@ -724,7 +724,7 @@ read_extension_aux_control_file(const ExtensionControlFile *pcontrol,
 	/*
 	 * Flat-copy the struct.  Pointer fields share values with original.
 	 */
-	acontrol = (ExtensionControlFile *) palloc(sizeof(ExtensionControlFile));
+	acontrol = palloc_object(ExtensionControlFile);
 	memcpy(acontrol, pcontrol, sizeof(ExtensionControlFile));
 
 	/*
@@ -931,7 +931,7 @@ execute_sql_string(const char *sql, const char *filename)
 	callback_arg.stmt_len = -1;
 
 	scripterrcontext.callback = script_error_callback;
-	scripterrcontext.arg = (void *) &callback_arg;
+	scripterrcontext.arg = &callback_arg;
 	scripterrcontext.previous = error_context_stack;
 	error_context_stack = &scripterrcontext;
 
@@ -1349,7 +1349,7 @@ get_ext_ver_info(const char *versionname, List **evi_list)
 			return evi;
 	}
 
-	evi = (ExtensionVersionInfo *) palloc(sizeof(ExtensionVersionInfo));
+	evi = palloc_object(ExtensionVersionInfo);
 	evi->name = pstrdup(versionname);
 	evi->reachable = NIL;
 	evi->installable = false;

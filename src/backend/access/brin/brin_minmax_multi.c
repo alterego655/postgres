@@ -276,7 +276,7 @@ static int	compare_values(const void *a, const void *b, void *arg);
  * function (which should be BTLessStrategyNumber).
  */
 static void
-AssertArrayOrder(FmgrInfo *cmp, Oid colloid, Datum *values, int nvalues)
+AssertArrayOrder(FmgrInfo *cmp, Oid colloid, const Datum *values, int nvalues)
 {
 	int			i;
 	Datum		lt;
@@ -1340,7 +1340,7 @@ build_distances(FmgrInfo *distanceFn, Oid colloid,
 		return NULL;
 
 	ndistances = (neranges - 1);
-	distances = (DistanceValue *) palloc0(sizeof(DistanceValue) * ndistances);
+	distances = palloc0_array(DistanceValue, ndistances);
 
 	/*
 	 * Walk through the ranges once and compute the distance between the
@@ -1504,7 +1504,7 @@ reduce_expanded_ranges(ExpandedRange *eranges, int neranges,
 
 	/* allocate space for the boundary values */
 	nvalues = 0;
-	values = (Datum *) palloc(sizeof(Datum) * max_values);
+	values = palloc_array(Datum, max_values);
 
 	/* add the global min/max values, from the first/last range */
 	values[nvalues++] = eranges[0].minval;

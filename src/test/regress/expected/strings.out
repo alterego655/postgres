@@ -260,6 +260,64 @@ SELECT reverse('\xabcd'::bytea);
  \xcdab
 (1 row)
 
+SELECT ('\x' || repeat(' ', 32))::bytea;
+ bytea 
+-------
+ \x
+(1 row)
+
+SELECT ('\x' || repeat('!', 32))::bytea;
+ERROR:  invalid hexadecimal digit: "!"
+SELECT ('\x' || repeat('/', 34))::bytea;
+ERROR:  invalid hexadecimal digit: "/"
+SELECT ('\x' || repeat('0', 34))::bytea;
+                bytea                 
+--------------------------------------
+ \x0000000000000000000000000000000000
+(1 row)
+
+SELECT ('\x' || repeat('9', 32))::bytea;
+               bytea                
+------------------------------------
+ \x99999999999999999999999999999999
+(1 row)
+
+SELECT ('\x' || repeat(':', 32))::bytea;
+ERROR:  invalid hexadecimal digit: ":"
+SELECT ('\x' || repeat('@', 34))::bytea;
+ERROR:  invalid hexadecimal digit: "@"
+SELECT ('\x' || repeat('A', 34))::bytea;
+                bytea                 
+--------------------------------------
+ \xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+(1 row)
+
+SELECT ('\x' || repeat('F', 32))::bytea;
+               bytea                
+------------------------------------
+ \xffffffffffffffffffffffffffffffff
+(1 row)
+
+SELECT ('\x' || repeat('G', 32))::bytea;
+ERROR:  invalid hexadecimal digit: "G"
+SELECT ('\x' || repeat('`', 34))::bytea;
+ERROR:  invalid hexadecimal digit: "`"
+SELECT ('\x' || repeat('a', 34))::bytea;
+                bytea                 
+--------------------------------------
+ \xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+(1 row)
+
+SELECT ('\x' || repeat('f', 32))::bytea;
+               bytea                
+------------------------------------
+ \xffffffffffffffffffffffffffffffff
+(1 row)
+
+SELECT ('\x' || repeat('g', 32))::bytea;
+ERROR:  invalid hexadecimal digit: "g"
+SELECT ('\x' || repeat('~', 34))::bytea;
+ERROR:  invalid hexadecimal digit: "~"
 SET bytea_output TO escape;
 SELECT E'\\xDeAdBeEf'::bytea;
       bytea       
@@ -2517,6 +2575,13 @@ SELECT decode(encode('\x1234567890abcdef00', 'escape'), 'escape');
  \x1234567890abcdef00
 (1 row)
 
+-- report an error with a hint listing valid encodings when an invalid encoding is specified
+SELECT encode('\x01'::bytea, 'invalid');  -- error
+ERROR:  unrecognized encoding: "invalid"
+HINT:  Valid encodings are "base64", "base64url", "escape", and "hex".
+SELECT decode('00', 'invalid');           -- error
+ERROR:  unrecognized encoding: "invalid"
+HINT:  Valid encodings are "base64", "base64url", "escape", and "hex".
 --
 -- base64url encoding/decoding
 --

@@ -91,7 +91,7 @@
  * behave as if two_phase = off. When the apply worker detects that all
  * tablesyncs have become READY (while the tri-state was PENDING) it will
  * restart the apply worker process. This happens in
- * process_syncing_tables_for_apply.
+ * ProcessSyncingTablesForApply.
  *
  * When the (re-started) apply worker finds that all tablesyncs are READY for a
  * two_phase tri-state of PENDING it start streaming messages with the
@@ -514,7 +514,7 @@ bool		InitializingApplyWorker = false;
  * by the user.
  */
 static XLogRecPtr skip_xact_finish_lsn = InvalidXLogRecPtr;
-#define is_skipping_changes() (unlikely(!XLogRecPtrIsInvalid(skip_xact_finish_lsn)))
+#define is_skipping_changes() (unlikely(XLogRecPtrIsValid(skip_xact_finish_lsn)))
 
 /* BufFile handle of the current streaming file */
 static BufFile *stream_fd = NULL;
@@ -702,6 +702,11 @@ should_apply_changes_for_rel(LogicalRepRelMapEntry *rel)
 					(rel->state == SUBREL_STATE_SYNCDONE &&
 					 rel->statelsn <= remote_final_lsn));
 
+		case WORKERTYPE_SEQUENCESYNC:
+			/* Should never happen. */
+			elog(ERROR, "sequence synchronization worker is not expected to apply changes");
+			break;
+
 		case WORKERTYPE_UNKNOWN:
 			/* Should never happen. */
 			elog(ERROR, "Unknown worker type");
@@ -870,7 +875,7 @@ create_edata_for_relation(LogicalRepRelMapEntry *rel)
 	List	   *perminfos = NIL;
 	ResultRelInfo *resultRelInfo;
 
-	edata = (ApplyExecutionData *) palloc0(sizeof(ApplyExecutionData));
+	edata = palloc0_object(ApplyExecutionData);
 	edata->targetRel = rel;
 
 	edata->estate = estate = CreateExecutorState();
@@ -975,9 +980,10 @@ slot_fill_defaults(LogicalRepRelMapEntry *rel, EState *estate,
 	Assert(rel->attrmap->maplen == num_phys_attrs);
 	for (attnum = 0; attnum < num_phys_attrs; attnum++)
 	{
+		CompactAttribute *cattr = TupleDescCompactAttr(desc, attnum);
 		Expr	   *defexpr;
 
-		if (TupleDescAttr(desc, attnum)->attisdropped || TupleDescAttr(desc, attnum)->attgenerated)
+		if (cattr->attisdropped || cattr->attgenerated)
 			continue;
 
 		if (rel->attrmap->attnums[attnum] >= 0)
@@ -1242,8 +1248,11 @@ apply_handle_commit(StringInfo s)
 
 	apply_handle_commit_internal(&commit_data);
 
-	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(commit_data.end_lsn);
+	/*
+	 * Process any tables that are being synchronized in parallel, as well as
+	 * any newly added tables or sequences.
+	 */
+	ProcessSyncingRelations(commit_data.end_lsn);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 	reset_apply_error_context_info();
@@ -1364,8 +1373,11 @@ apply_handle_prepare(StringInfo s)
 
 	in_remote_transaction = false;
 
-	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(prepare_data.end_lsn);
+	/*
+	 * Process any tables that are being synchronized in parallel, as well as
+	 * any newly added tables or sequences.
+	 */
+	ProcessSyncingRelations(prepare_data.end_lsn);
 
 	/*
 	 * Since we have already prepared the transaction, in a case where the
@@ -1420,8 +1432,11 @@ apply_handle_commit_prepared(StringInfo s)
 	store_flush_position(prepare_data.end_lsn, XactLastCommitEnd);
 	in_remote_transaction = false;
 
-	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(prepare_data.end_lsn);
+	/*
+	 * Process any tables that are being synchronized in parallel, as well as
+	 * any newly added tables or sequences.
+	 */
+	ProcessSyncingRelations(prepare_data.end_lsn);
 
 	clear_subscription_skip_lsn(prepare_data.end_lsn);
 
@@ -1486,8 +1501,11 @@ apply_handle_rollback_prepared(StringInfo s)
 	store_flush_position(rollback_data.rollback_end_lsn, InvalidXLogRecPtr);
 	in_remote_transaction = false;
 
-	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(rollback_data.rollback_end_lsn);
+	/*
+	 * Process any tables that are being synchronized in parallel, as well as
+	 * any newly added tables or sequences.
+	 */
+	ProcessSyncingRelations(rollback_data.rollback_end_lsn);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 	reset_apply_error_context_info();
@@ -1621,8 +1639,11 @@ apply_handle_stream_prepare(StringInfo s)
 
 	pgstat_report_stat(false);
 
-	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(prepare_data.end_lsn);
+	/*
+	 * Process any tables that are being synchronized in parallel, as well as
+	 * any newly added tables or sequences.
+	 */
+	ProcessSyncingRelations(prepare_data.end_lsn);
 
 	/*
 	 * Similar to prepare case, the subskiplsn could be left in a case of
@@ -1681,7 +1702,7 @@ stream_start_internal(TransactionId xid, bool first_segment)
 
 		oldctx = MemoryContextSwitchTo(ApplyContext);
 
-		MyLogicalRepWorker->stream_fileset = palloc(sizeof(FileSet));
+		MyLogicalRepWorker->stream_fileset = palloc_object(FileSet);
 		FileSetInit(MyLogicalRepWorker->stream_fileset);
 
 		MemoryContextSwitchTo(oldctx);
@@ -1816,7 +1837,8 @@ apply_handle_stream_start(StringInfo s)
 				 * Signal the leader apply worker, as it may be waiting for
 				 * us.
 				 */
-				logicalrep_worker_wakeup(MyLogicalRepWorker->subid, InvalidOid);
+				logicalrep_worker_wakeup(WORKERTYPE_APPLY,
+										 MyLogicalRepWorker->subid, InvalidOid);
 			}
 
 			parallel_stream_nchanges = 0;
@@ -2463,8 +2485,11 @@ apply_handle_stream_commit(StringInfo s)
 			break;
 	}
 
-	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(commit_data.end_lsn);
+	/*
+	 * Process any tables that are being synchronized in parallel, as well as
+	 * any newly added tables or sequences.
+	 */
+	ProcessSyncingRelations(commit_data.end_lsn);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 
@@ -2833,7 +2858,7 @@ apply_handle_update(StringInfo s)
 	target_perminfo = list_nth(estate->es_rteperminfos, 0);
 	for (int i = 0; i < remoteslot->tts_tupleDescriptor->natts; i++)
 	{
-		Form_pg_attribute att = TupleDescAttr(remoteslot->tts_tupleDescriptor, i);
+		CompactAttribute *att = TupleDescCompactAttr(remoteslot->tts_tupleDescriptor, i);
 		int			remoteattnum = rel->attrmap->attnums[i];
 
 		if (!att->attisdropped && remoteattnum >= 0)
@@ -3283,8 +3308,9 @@ FindDeletedTupleInLocalRel(Relation localrel, Oid localidxoid,
 		 * maybe_advance_nonremovable_xid() for details).
 		 */
 		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
-		leader = logicalrep_worker_find(MyLogicalRepWorker->subid,
-										InvalidOid, false);
+		leader = logicalrep_worker_find(WORKERTYPE_APPLY,
+										MyLogicalRepWorker->subid, InvalidOid,
+										false);
 		if (!leader)
 		{
 			ereport(ERROR,
@@ -3367,6 +3393,7 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 	 * at CREATE/ALTER SUBSCRIPTION would be insufficient.
 	 */
 	CheckSubscriptionRelkind(partrel->rd_rel->relkind,
+							 relmapentry->remoterel.relkind,
 							 get_namespace_name(RelationGetNamespace(partrel)),
 							 RelationGetRelationName(partrel));
 
@@ -3563,6 +3590,7 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 
 					/* Check that new partition also has supported relkind. */
 					CheckSubscriptionRelkind(partrel_new->rd_rel->relkind,
+											 relmapentry->remoterel.relkind,
 											 get_namespace_name(RelationGetNamespace(partrel_new)),
 											 RelationGetRelationName(partrel_new));
 
@@ -3923,7 +3951,7 @@ store_flush_position(XLogRecPtr remote_lsn, XLogRecPtr local_lsn)
 	MemoryContextSwitchTo(ApplyContext);
 
 	/* Track commit lsn  */
-	flushpos = (FlushPosition *) palloc(sizeof(FlushPosition));
+	flushpos = palloc_object(FlushPosition);
 	flushpos->local_end = local_lsn;
 	flushpos->remote_end = remote_lsn;
 
@@ -4098,7 +4126,7 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 						 * due to a bug, we don't want to proceed as it can
 						 * incorrectly advance oldest_nonremovable_xid.
 						 */
-						if (XLogRecPtrIsInvalid(rdt_data.remote_lsn))
+						if (!XLogRecPtrIsValid(rdt_data.remote_lsn))
 							elog(ERROR, "cannot get the latest WAL position from the publisher");
 
 						maybe_advance_nonremovable_xid(&rdt_data, true);
@@ -4132,8 +4160,11 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 			AcceptInvalidationMessages();
 			maybe_reread_subscription();
 
-			/* Process any table synchronization changes. */
-			process_syncing_tables(last_received);
+			/*
+			 * Process any relations that are being synchronized in parallel
+			 * and any newly added tables or sequences.
+			 */
+			ProcessSyncingRelations(last_received);
 		}
 
 		/* Cleanup the memory. */
@@ -4582,7 +4613,7 @@ wait_for_publisher_status(RetainDeadTuplesData *rdt_data,
 static void
 wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 {
-	Assert(!XLogRecPtrIsInvalid(rdt_data->remote_lsn) &&
+	Assert(XLogRecPtrIsValid(rdt_data->remote_lsn) &&
 		   TransactionIdIsValid(rdt_data->candidate_xid));
 
 	/*
@@ -4623,7 +4654,7 @@ wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 	 * RDT_GET_CANDIDATE_XID phase in such cases, this is unsafe. If users
 	 * concurrently add tables to the subscription, the apply worker may not
 	 * process invalidations in time. Consequently,
-	 * HasSubscriptionRelationsCached() might miss the new tables, leading to
+	 * HasSubscriptionTablesCached() might miss the new tables, leading to
 	 * premature advancement of oldest_nonremovable_xid.
 	 *
 	 * Performing the check during RDT_WAIT_FOR_LOCAL_FLUSH is safe, as
@@ -4637,7 +4668,7 @@ wait_for_local_flush(RetainDeadTuplesData *rdt_data)
 	 * subscription tables at this stage to prevent unnecessary tuple
 	 * retention.
 	 */
-	if (HasSubscriptionRelationsCached() && !AllTablesyncsReady())
+	if (HasSubscriptionTablesCached() && !AllTablesyncsReady())
 	{
 		TimestampTz now;
 
@@ -5530,7 +5561,7 @@ set_stream_options(WalRcvStreamOptions *options,
  * Cleanup the memory for subxacts and reset the related variables.
  */
 static inline void
-cleanup_subxact_info()
+cleanup_subxact_info(void)
 {
 	if (subxact_data.subxacts)
 		pfree(subxact_data.subxacts);
@@ -5575,7 +5606,8 @@ start_apply(XLogRecPtr origin_startpos)
 			 * idle state.
 			 */
 			AbortOutOfAnyTransaction();
-			pgstat_report_subscription_error(MySubscription->oid, !am_tablesync_worker());
+			pgstat_report_subscription_error(MySubscription->oid,
+											 MyLogicalRepWorker->type);
 
 			PG_RE_THROW();
 		}
@@ -5589,7 +5621,7 @@ start_apply(XLogRecPtr origin_startpos)
  * It sets up replication origin, streaming options and then starts streaming.
  */
 static void
-run_apply_worker()
+run_apply_worker(void)
 {
 	char		originname[NAMEDATALEN];
 	XLogRecPtr	origin_startpos = InvalidXLogRecPtr;
@@ -5695,8 +5727,8 @@ run_apply_worker()
 }
 
 /*
- * Common initialization for leader apply worker, parallel apply worker and
- * tablesync worker.
+ * Common initialization for leader apply worker, parallel apply worker,
+ * tablesync worker and sequencesync worker.
  *
  * Initialize the database connection, in-memory subscription and necessary
  * config options.
@@ -5804,13 +5836,17 @@ InitializeLogRepWorker(void)
 
 	if (am_tablesync_worker())
 		ereport(LOG,
-				(errmsg("logical replication table synchronization worker for subscription \"%s\", table \"%s\" has started",
-						MySubscription->name,
-						get_rel_name(MyLogicalRepWorker->relid))));
+				errmsg("logical replication table synchronization worker for subscription \"%s\", table \"%s\" has started",
+					   MySubscription->name,
+					   get_rel_name(MyLogicalRepWorker->relid)));
+	else if (am_sequencesync_worker())
+		ereport(LOG,
+				errmsg("logical replication sequence synchronization worker for subscription \"%s\" has started",
+					   MySubscription->name));
 	else
 		ereport(LOG,
-				(errmsg("logical replication apply worker for subscription \"%s\" has started",
-						MySubscription->name)));
+				errmsg("logical replication apply worker for subscription \"%s\" has started",
+					   MySubscription->name));
 
 	CommitTransactionCommand();
 }
@@ -5826,14 +5862,16 @@ replorigin_reset(int code, Datum arg)
 	replorigin_session_origin_timestamp = 0;
 }
 
-/* Common function to setup the leader apply or tablesync worker. */
+/*
+ * Common function to setup the leader apply, tablesync and sequencesync worker.
+ */
 void
 SetupApplyOrSyncWorker(int worker_slot)
 {
 	/* Attach to slot */
 	logicalrep_worker_attach(worker_slot);
 
-	Assert(am_tablesync_worker() || am_leader_apply_worker());
+	Assert(am_tablesync_worker() || am_sequencesync_worker() || am_leader_apply_worker());
 
 	/* Setup signal handling */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -5876,7 +5914,7 @@ SetupApplyOrSyncWorker(int worker_slot)
 	 * the subscription relation state.
 	 */
 	CacheRegisterSyscacheCallback(SUBSCRIPTIONRELMAP,
-								  invalidate_syncing_table_states,
+								  InvalidateSyncingRelStates,
 								  (Datum) 0);
 }
 
@@ -5916,9 +5954,12 @@ DisableSubscriptionAndExit(void)
 
 	RESUME_INTERRUPTS();
 
-	/* Report the worker failed during either table synchronization or apply */
+	/*
+	 * Report the worker failed during sequence synchronization, table
+	 * synchronization, or apply.
+	 */
 	pgstat_report_subscription_error(MyLogicalRepWorker->subid,
-									 !am_tablesync_worker());
+									 MyLogicalRepWorker->type);
 
 	/* Disable the subscription */
 	StartTransactionCommand();
@@ -5988,7 +6029,7 @@ maybe_start_skipping_changes(XLogRecPtr finish_lsn)
 	 * function is called for every remote transaction and we assume that
 	 * skipping the transaction is not used often.
 	 */
-	if (likely(XLogRecPtrIsInvalid(MySubscription->skiplsn) ||
+	if (likely(!XLogRecPtrIsValid(MySubscription->skiplsn) ||
 			   MySubscription->skiplsn != finish_lsn))
 		return;
 
@@ -6034,7 +6075,7 @@ clear_subscription_skip_lsn(XLogRecPtr finish_lsn)
 	XLogRecPtr	myskiplsn = MySubscription->skiplsn;
 	bool		started_tx = false;
 
-	if (likely(XLogRecPtrIsInvalid(myskiplsn)) || am_parallel_apply_worker())
+	if (likely(!XLogRecPtrIsValid(myskiplsn)) || am_parallel_apply_worker())
 		return;
 
 	if (!IsTransactionState())
@@ -6130,7 +6171,7 @@ apply_error_callback(void *arg)
 			errcontext("processing remote data for replication origin \"%s\" during message type \"%s\"",
 					   errarg->origin_name,
 					   logicalrep_message_type(errarg->command));
-		else if (XLogRecPtrIsInvalid(errarg->finish_lsn))
+		else if (!XLogRecPtrIsValid(errarg->finish_lsn))
 			errcontext("processing remote data for replication origin \"%s\" during message type \"%s\" in transaction %u",
 					   errarg->origin_name,
 					   logicalrep_message_type(errarg->command),
@@ -6146,7 +6187,7 @@ apply_error_callback(void *arg)
 	{
 		if (errarg->remote_attnum < 0)
 		{
-			if (XLogRecPtrIsInvalid(errarg->finish_lsn))
+			if (!XLogRecPtrIsValid(errarg->finish_lsn))
 				errcontext("processing remote data for replication origin \"%s\" during message type \"%s\" for replication target relation \"%s.%s\" in transaction %u",
 						   errarg->origin_name,
 						   logicalrep_message_type(errarg->command),
@@ -6164,7 +6205,7 @@ apply_error_callback(void *arg)
 		}
 		else
 		{
-			if (XLogRecPtrIsInvalid(errarg->finish_lsn))
+			if (!XLogRecPtrIsValid(errarg->finish_lsn))
 				errcontext("processing remote data for replication origin \"%s\" during message type \"%s\" for replication target relation \"%s.%s\" column \"%s\" in transaction %u",
 						   errarg->origin_name,
 						   logicalrep_message_type(errarg->command),

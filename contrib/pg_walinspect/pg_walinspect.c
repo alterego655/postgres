@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
@@ -82,7 +83,7 @@ GetCurrentLSN(void)
 	else
 		curr_lsn = GetXLogReplayRecPtr(NULL);
 
-	Assert(!XLogRecPtrIsInvalid(curr_lsn));
+	Assert(XLogRecPtrIsValid(curr_lsn));
 
 	return curr_lsn;
 }
@@ -108,8 +109,7 @@ InitXLogReaderState(XLogRecPtr lsn)
 				 errmsg("could not read WAL at LSN %X/%08X",
 						LSN_FORMAT_ARGS(lsn))));
 
-	private_data = (ReadLocalXLogPageNoWaitPrivate *)
-		palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	private_data = palloc0_object(ReadLocalXLogPageNoWaitPrivate);
 
 	xlogreader = XLogReaderAllocate(wal_segment_size, NULL,
 									XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
@@ -126,7 +126,7 @@ InitXLogReaderState(XLogRecPtr lsn)
 	/* first find a valid recptr to start from */
 	first_valid_record = XLogFindNextRecord(xlogreader, lsn);
 
-	if (XLogRecPtrIsInvalid(first_valid_record))
+	if (!XLogRecPtrIsValid(first_valid_record))
 		ereport(ERROR,
 				errmsg("could not find a valid record after %X/%08X",
 					   LSN_FORMAT_ARGS(lsn)));
@@ -309,7 +309,7 @@ GetWALBlockInfo(FunctionCallInfo fcinfo, XLogReaderState *record,
 			/* Construct and save block_fpi_info */
 			bitcnt = pg_popcount((const char *) &blk->bimg_info,
 								 sizeof(uint8));
-			flags = (Datum *) palloc0(sizeof(Datum) * bitcnt);
+			flags = palloc0_array(Datum, bitcnt);
 			if ((blk->bimg_info & BKPIMAGE_HAS_HOLE) != 0)
 				flags[cnt++] = CStringGetTextDatum("HAS_HOLE");
 			if (blk->apply_image)

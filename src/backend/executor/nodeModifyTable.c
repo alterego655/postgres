@@ -68,6 +68,7 @@
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/injection_point.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -580,8 +581,8 @@ ExecComputeStoredGenerated(ResultRelInfo *resultRelInfo,
 
 	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
-	values = palloc(sizeof(*values) * natts);
-	nulls = palloc(sizeof(*nulls) * natts);
+	values = palloc_array(Datum, natts);
+	nulls = palloc_array(bool, natts);
 
 	slot_getallattrs(slot);
 	memcpy(nulls, slot->tts_isnull, sizeof(*nulls) * natts);
@@ -961,10 +962,8 @@ ExecInsert(ModifyTableContext *context,
 
 			if (resultRelInfo->ri_Slots == NULL)
 			{
-				resultRelInfo->ri_Slots = palloc(sizeof(TupleTableSlot *) *
-												 resultRelInfo->ri_BatchSize);
-				resultRelInfo->ri_PlanSlots = palloc(sizeof(TupleTableSlot *) *
-													 resultRelInfo->ri_BatchSize);
+				resultRelInfo->ri_Slots = palloc_array(TupleTableSlot *, resultRelInfo->ri_BatchSize);
+				resultRelInfo->ri_PlanSlots = palloc_array(TupleTableSlot *, resultRelInfo->ri_BatchSize);
 			}
 
 			/*
@@ -1186,6 +1185,7 @@ ExecInsert(ModifyTableContext *context,
 			 * if we're going to go ahead with the insertion, instead of
 			 * waiting for the whole transaction to complete.
 			 */
+			INJECTION_POINT("exec-insert-before-insert-speculative", NULL);
 			specToken = SpeculativeInsertionLockAcquire(GetCurrentTransactionId());
 
 			/* insert the tuple, with the speculative token */
@@ -3467,7 +3467,28 @@ lmerge_matched:
 
 								/* Switch lists, if necessary */
 								if (!*matched)
+								{
 									actionStates = mergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE];
+
+									/*
+									 * If we have both NOT MATCHED BY SOURCE
+									 * and NOT MATCHED BY TARGET actions (a
+									 * full join between the source and target
+									 * relations), the single previously
+									 * matched tuple from the outer plan node
+									 * is treated as two not matched tuples,
+									 * in the same way as if they had not
+									 * matched to start with.  Therefore, we
+									 * must adjust the outer plan node's tuple
+									 * count, if we're instrumenting the
+									 * query, to get the correct "skipped" row
+									 * count --- see show_modifytable_info().
+									 */
+									if (outerPlanState(mtstate)->instrument &&
+										mergeActions[MERGE_WHEN_NOT_MATCHED_BY_SOURCE] &&
+										mergeActions[MERGE_WHEN_NOT_MATCHED_BY_TARGET])
+										InstrUpdateTupleCount(outerPlanState(mtstate)->instrument, 1.0);
+								}
 							}
 
 							/*
@@ -4722,8 +4743,7 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 	mtstate->mt_done = false;
 
 	mtstate->mt_nrels = nrels;
-	mtstate->resultRelInfo = (ResultRelInfo *)
-		palloc(nrels * sizeof(ResultRelInfo));
+	mtstate->resultRelInfo = palloc_array(ResultRelInfo, nrels);
 
 	mtstate->mt_merge_pending_not_matched = NULL;
 	mtstate->mt_merge_inserted = 0;

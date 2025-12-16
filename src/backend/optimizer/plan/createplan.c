@@ -226,7 +226,7 @@ static RecursiveUnion *make_recursive_union(List *tlist,
 											Plan *righttree,
 											int wtParam,
 											List *distinctList,
-											long numGroups);
+											Cardinality numGroups);
 static BitmapAnd *make_bitmap_and(List *bitmapplans);
 static BitmapOr *make_bitmap_or(List *bitmapplans);
 static NestLoop *make_nestloop(List *tlist,
@@ -301,7 +301,7 @@ static Gather *make_gather(List *qptlist, List *qpqual,
 						   int nworkers, int rescan_param, bool single_copy, Plan *subplan);
 static SetOp *make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 						 List *tlist, Plan *lefttree, Plan *righttree,
-						 List *groupList, long numGroups);
+						 List *groupList, Cardinality numGroups);
 static LockRows *make_lockrows(Plan *lefttree, List *rowMarks, int epqParam);
 static Result *make_gating_result(List *tlist, Node *resconstantqual,
 								  Plan *subplan);
@@ -311,7 +311,6 @@ static ProjectSet *make_project_set(List *tlist, Plan *subplan);
 static ModifyTable *make_modifytable(PlannerInfo *root, Plan *subplan,
 									 CmdType operation, bool canSetTag,
 									 Index nominalRelation, Index rootRelation,
-									 bool partColsUpdated,
 									 List *resultRelations,
 									 List *updateColnosLists,
 									 List *withCheckOptionLists, List *returningLists,
@@ -2208,7 +2207,7 @@ remap_groupColIdx(PlannerInfo *root, List *groupClause)
 
 	Assert(grouping_map);
 
-	new_grpColIdx = palloc0(sizeof(AttrNumber) * list_length(groupClause));
+	new_grpColIdx = palloc0_array(AttrNumber, list_length(groupClause));
 
 	i = 0;
 	foreach(lc, groupClause)
@@ -2497,9 +2496,9 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 	 * Convert SortGroupClause lists into arrays of attr indexes and equality
 	 * operators, as wanted by executor.
 	 */
-	partColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numPart);
-	partOperators = (Oid *) palloc(sizeof(Oid) * numPart);
-	partCollations = (Oid *) palloc(sizeof(Oid) * numPart);
+	partColIdx = palloc_array(AttrNumber, numPart);
+	partOperators = palloc_array(Oid, numPart);
+	partCollations = palloc_array(Oid, numPart);
 
 	partNumCols = 0;
 	foreach(lc, wc->partitionClause)
@@ -2514,9 +2513,9 @@ create_windowagg_plan(PlannerInfo *root, WindowAggPath *best_path)
 		partNumCols++;
 	}
 
-	ordColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numOrder);
-	ordOperators = (Oid *) palloc(sizeof(Oid) * numOrder);
-	ordCollations = (Oid *) palloc(sizeof(Oid) * numOrder);
+	ordColIdx = palloc_array(AttrNumber, numOrder);
+	ordOperators = palloc_array(Oid, numOrder);
+	ordCollations = palloc_array(Oid, numOrder);
 
 	ordNumCols = 0;
 	foreach(lc, wc->orderClause)
@@ -2565,7 +2564,6 @@ create_setop_plan(PlannerInfo *root, SetOpPath *best_path, int flags)
 	List	   *tlist = build_path_tlist(root, &best_path->path);
 	Plan	   *leftplan;
 	Plan	   *rightplan;
-	long		numGroups;
 
 	/*
 	 * SetOp doesn't project, so tlist requirements pass through; moreover we
@@ -2576,16 +2574,13 @@ create_setop_plan(PlannerInfo *root, SetOpPath *best_path, int flags)
 	rightplan = create_plan_recurse(root, best_path->rightpath,
 									flags | CP_LABEL_TLIST);
 
-	/* Convert numGroups to long int --- but 'ware overflow! */
-	numGroups = clamp_cardinality_to_long(best_path->numGroups);
-
 	plan = make_setop(best_path->cmd,
 					  best_path->strategy,
 					  tlist,
 					  leftplan,
 					  rightplan,
 					  best_path->groupList,
-					  numGroups);
+					  best_path->numGroups);
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
@@ -2605,7 +2600,6 @@ create_recursiveunion_plan(PlannerInfo *root, RecursiveUnionPath *best_path)
 	Plan	   *leftplan;
 	Plan	   *rightplan;
 	List	   *tlist;
-	long		numGroups;
 
 	/* Need both children to produce same tlist, so force it */
 	leftplan = create_plan_recurse(root, best_path->leftpath, CP_EXACT_TLIST);
@@ -2613,15 +2607,12 @@ create_recursiveunion_plan(PlannerInfo *root, RecursiveUnionPath *best_path)
 
 	tlist = build_path_tlist(root, &best_path->path);
 
-	/* Convert numGroups to long int --- but 'ware overflow! */
-	numGroups = clamp_cardinality_to_long(best_path->numGroups);
-
 	plan = make_recursive_union(tlist,
 								leftplan,
 								rightplan,
 								best_path->wtParam,
 								best_path->distinctList,
-								numGroups);
+								best_path->numGroups);
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
@@ -2676,7 +2667,6 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
 							best_path->canSetTag,
 							best_path->nominalRelation,
 							best_path->rootRelation,
-							best_path->partColsUpdated,
 							best_path->resultRelations,
 							best_path->updateColnosLists,
 							best_path->withCheckOptionLists,
@@ -5847,7 +5837,7 @@ make_recursive_union(List *tlist,
 					 Plan *righttree,
 					 int wtParam,
 					 List *distinctList,
-					 long numGroups)
+					 Cardinality numGroups)
 {
 	RecursiveUnion *node = makeNode(RecursiveUnion);
 	Plan	   *plan = &node->plan;
@@ -5872,9 +5862,9 @@ make_recursive_union(List *tlist,
 		Oid		   *dupCollations;
 		ListCell   *slitem;
 
-		dupColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numCols);
-		dupOperators = (Oid *) palloc(sizeof(Oid) * numCols);
-		dupCollations = (Oid *) palloc(sizeof(Oid) * numCols);
+		dupColIdx = palloc_array(AttrNumber, numCols);
+		dupOperators = palloc_array(Oid, numCols);
+		dupCollations = palloc_array(Oid, numCols);
 
 		foreach(slitem, distinctList)
 		{
@@ -6584,15 +6574,11 @@ Agg *
 make_agg(List *tlist, List *qual,
 		 AggStrategy aggstrategy, AggSplit aggsplit,
 		 int numGroupCols, AttrNumber *grpColIdx, Oid *grpOperators, Oid *grpCollations,
-		 List *groupingSets, List *chain, double dNumGroups,
+		 List *groupingSets, List *chain, Cardinality numGroups,
 		 Size transitionSpace, Plan *lefttree)
 {
 	Agg		   *node = makeNode(Agg);
 	Plan	   *plan = &node->plan;
-	long		numGroups;
-
-	/* Reduce to long, but 'ware overflow! */
-	numGroups = clamp_cardinality_to_long(dNumGroups);
 
 	node->aggstrategy = aggstrategy;
 	node->aggsplit = aggsplit;
@@ -6708,9 +6694,9 @@ make_unique_from_pathkeys(Plan *lefttree, List *pathkeys, int numCols,
 	 * prepare_sort_from_pathkeys ... maybe unify sometime?
 	 */
 	Assert(numCols >= 0 && numCols <= list_length(pathkeys));
-	uniqColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numCols);
-	uniqOperators = (Oid *) palloc(sizeof(Oid) * numCols);
-	uniqCollations = (Oid *) palloc(sizeof(Oid) * numCols);
+	uniqColIdx = palloc_array(AttrNumber, numCols);
+	uniqOperators = palloc_array(Oid, numCols);
+	uniqCollations = palloc_array(Oid, numCols);
 
 	foreach(lc, pathkeys)
 	{
@@ -6824,7 +6810,7 @@ make_gather(List *qptlist,
 static SetOp *
 make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 		   List *tlist, Plan *lefttree, Plan *righttree,
-		   List *groupList, long numGroups)
+		   List *groupList, Cardinality numGroups)
 {
 	SetOp	   *node = makeNode(SetOp);
 	Plan	   *plan = &node->plan;
@@ -6845,10 +6831,10 @@ make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 	 * convert SortGroupClause list into arrays of attr indexes and comparison
 	 * operators, as wanted by executor
 	 */
-	cmpColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numCols);
-	cmpOperators = (Oid *) palloc(sizeof(Oid) * numCols);
-	cmpCollations = (Oid *) palloc(sizeof(Oid) * numCols);
-	cmpNullsFirst = (bool *) palloc(sizeof(bool) * numCols);
+	cmpColIdx = palloc_array(AttrNumber, numCols);
+	cmpOperators = palloc_array(Oid, numCols);
+	cmpCollations = palloc_array(Oid, numCols);
+	cmpNullsFirst = palloc_array(bool, numCols);
 
 	foreach(slitem, groupList)
 	{
@@ -7010,7 +6996,6 @@ static ModifyTable *
 make_modifytable(PlannerInfo *root, Plan *subplan,
 				 CmdType operation, bool canSetTag,
 				 Index nominalRelation, Index rootRelation,
-				 bool partColsUpdated,
 				 List *resultRelations,
 				 List *updateColnosLists,
 				 List *withCheckOptionLists, List *returningLists,
@@ -7047,7 +7032,6 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 	node->canSetTag = canSetTag;
 	node->nominalRelation = nominalRelation;
 	node->rootRelation = rootRelation;
-	node->partColsUpdated = partColsUpdated;
 	node->resultRelations = resultRelations;
 	if (!onconflict)
 	{

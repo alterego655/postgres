@@ -189,7 +189,7 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 		nParamExec = list_length(queryDesc->plannedstmt->paramExecTypes);
 		estate->es_param_exec_vals = (ParamExecData *)
-			palloc0(nParamExec * sizeof(ParamExecData));
+			palloc0_array(ParamExecData, nParamExec);
 	}
 
 	/* We now require all callers to provide sourceText */
@@ -876,7 +876,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	if (plannedstmt->rowMarks)
 	{
 		estate->es_rowmarks = (ExecRowMark **)
-			palloc0(estate->es_range_table_size * sizeof(ExecRowMark *));
+			palloc0_array(ExecRowMark *, estate->es_range_table_size);
 		foreach(l, plannedstmt->rowMarks)
 		{
 			PlanRowMark *rc = (PlanRowMark *) lfirst(l);
@@ -920,7 +920,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 			if (relation)
 				CheckValidRowMarkRel(relation, rc->markType);
 
-			erm = (ExecRowMark *) palloc(sizeof(ExecRowMark));
+			erm = palloc_object(ExecRowMark);
 			erm->relation = relation;
 			erm->relid = relid;
 			erm->rti = rc->rti;
@@ -1262,9 +1262,9 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 		int			n = resultRelInfo->ri_TrigDesc->numtriggers;
 
 		resultRelInfo->ri_TrigFunctions = (FmgrInfo *)
-			palloc0(n * sizeof(FmgrInfo));
+			palloc0_array(FmgrInfo, n);
 		resultRelInfo->ri_TrigWhenExprs = (ExprState **)
-			palloc0(n * sizeof(ExprState *));
+			palloc0_array(ExprState *, n);
 		if (instrument_options)
 			resultRelInfo->ri_TrigInstrument = InstrAlloc(n, instrument_options, false);
 	}
@@ -1326,10 +1326,9 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
  *		Get a ResultRelInfo for a trigger target relation.
  *
  * Most of the time, triggers are fired on one of the result relations of the
- * query, and so we can just return a member of the es_result_relations array,
- * or the es_tuple_routing_result_relations list (if any). (Note: in self-join
- * situations there might be multiple members with the same OID; if so it
- * doesn't matter which one we pick.)
+ * query, and so we can just return a suitable one we already made and stored
+ * in the es_opened_result_relations or es_tuple_routing_result_relations
+ * Lists.
  *
  * However, it is sometimes necessary to fire triggers on other relations;
  * this happens mainly when an RI update trigger queues additional triggers
@@ -1349,11 +1348,20 @@ ExecGetTriggerResultRel(EState *estate, Oid relid,
 	Relation	rel;
 	MemoryContext oldcontext;
 
+	/*
+	 * Before creating a new ResultRelInfo, check if we've already made and
+	 * cached one for this relation.  We must ensure that the given
+	 * 'rootRelInfo' matches the one stored in the cached ResultRelInfo as
+	 * trigger handling for partitions can result in mixed requirements for
+	 * what ri_RootResultRelInfo is set to.
+	 */
+
 	/* Search through the query result relations */
 	foreach(l, estate->es_opened_result_relations)
 	{
 		rInfo = lfirst(l);
-		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid)
+		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
+			rInfo->ri_RootResultRelInfo == rootRelInfo)
 			return rInfo;
 	}
 
@@ -1364,7 +1372,8 @@ ExecGetTriggerResultRel(EState *estate, Oid relid,
 	foreach(l, estate->es_tuple_routing_result_relations)
 	{
 		rInfo = (ResultRelInfo *) lfirst(l);
-		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid)
+		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
+			rInfo->ri_RootResultRelInfo == rootRelInfo)
 			return rInfo;
 	}
 
@@ -1372,7 +1381,8 @@ ExecGetTriggerResultRel(EState *estate, Oid relid,
 	foreach(l, estate->es_trig_target_relations)
 	{
 		rInfo = (ResultRelInfo *) lfirst(l);
-		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid)
+		if (RelationGetRelid(rInfo->ri_RelationDesc) == relid &&
+			rInfo->ri_RootResultRelInfo == rootRelInfo)
 			return rInfo;
 	}
 	/* Nope, so we need a new one */
@@ -2568,7 +2578,7 @@ ExecFindRowMark(EState *estate, Index rti, bool missing_ok)
 ExecAuxRowMark *
 ExecBuildAuxRowMark(ExecRowMark *erm, List *targetlist)
 {
-	ExecAuxRowMark *aerm = (ExecAuxRowMark *) palloc0(sizeof(ExecAuxRowMark));
+	ExecAuxRowMark *aerm = palloc0_object(ExecAuxRowMark);
 	char		resname[32];
 
 	aerm->rowmark = erm;
@@ -2724,8 +2734,7 @@ EvalPlanQualInit(EPQState *epqstate, EState *parentestate,
 	 * EvalPlanQualBegin().
 	 */
 	epqstate->tuple_table = NIL;
-	epqstate->relsubs_slot = (TupleTableSlot **)
-		palloc0(rtsize * sizeof(TupleTableSlot *));
+	epqstate->relsubs_slot = palloc0_array(TupleTableSlot *, rtsize);
 
 	/* ... and remember data that EvalPlanQualBegin will need */
 	epqstate->plan = subplan;
@@ -3064,8 +3073,7 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 
 		/* now make the internal param workspace ... */
 		i = list_length(parentestate->es_plannedstmt->paramExecTypes);
-		rcestate->es_param_exec_vals = (ParamExecData *)
-			palloc0(i * sizeof(ParamExecData));
+		rcestate->es_param_exec_vals = palloc0_array(ParamExecData, i);
 		/* ... and copy down all values, whether really needed or not */
 		while (--i >= 0)
 		{
@@ -3093,6 +3101,9 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 	rcestate->es_part_prune_states = parentestate->es_part_prune_states;
 	rcestate->es_part_prune_results = parentestate->es_part_prune_results;
 
+	/* We'll also borrow the es_partition_directory from the parent state */
+	rcestate->es_partition_directory = parentestate->es_partition_directory;
+
 	/*
 	 * Initialize private state information for each SubPlan.  We must do this
 	 * before running ExecInitNode on the main query tree, since
@@ -3117,8 +3128,7 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 	 * EvalPlanQualFetchRowMark() can efficiently access the to be fetched
 	 * rowmark.
 	 */
-	epqstate->relsubs_rowmark = (ExecAuxRowMark **)
-		palloc0(rtsize * sizeof(ExecAuxRowMark *));
+	epqstate->relsubs_rowmark = palloc0_array(ExecAuxRowMark *, rtsize);
 	foreach(l, epqstate->arowMarks)
 	{
 		ExecAuxRowMark *earm = (ExecAuxRowMark *) lfirst(l);
@@ -3209,6 +3219,13 @@ EvalPlanQualEnd(EPQState *epqstate)
 	ExecCloseResultRelations(estate);
 
 	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * NULLify the partition directory before freeing the executor state.
+	 * Since EvalPlanQualStart() just borrowed the parent EState's directory,
+	 * we'd better leave it up to the parent to delete it.
+	 */
+	estate->es_partition_directory = NULL;
 
 	FreeExecutorState(estate);
 

@@ -22,6 +22,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 
 static void printtup_startup(DestReceiver *self, int operation,
@@ -70,7 +71,7 @@ typedef struct
 DestReceiver *
 printtup_create_DR(CommandDest dest)
 {
-	DR_printtup *self = (DR_printtup *) palloc0(sizeof(DR_printtup));
+	DR_printtup *self = palloc0_object(DR_printtup);
 
 	self->pub.receiveSlot = printtup;	/* might get changed later */
 	self->pub.rStartup = printtup_startup;
@@ -430,7 +431,7 @@ printatt(unsigned attributeId,
 		   value != NULL ? " = \"" : "",
 		   value != NULL ? value : "",
 		   value != NULL ? "\"" : "",
-		   (unsigned int) (attributeP->atttypid),
+		   attributeP->atttypid,
 		   attributeP->attlen,
 		   attributeP->atttypmod,
 		   attributeP->attbyval ? 't' : 'f');

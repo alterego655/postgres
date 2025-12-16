@@ -1019,7 +1019,8 @@ ExecCheckpoint(ParseState *pstate, CheckPointStmt *stmt)
 			else if (strcmp(mode, "fast") != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("unrecognized MODE option \"%s\"", mode),
+						 errmsg("unrecognized value for %s option \"%s\": \"%s\"",
+								"CHECKPOINT", "mode", mode),
 						 parser_errposition(pstate, opt->location)));
 		}
 		else if (strcmp(opt->defname, "flush_unlogged") == 0)
@@ -1027,7 +1028,8 @@ ExecCheckpoint(ParseState *pstate, CheckPointStmt *stmt)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("unrecognized CHECKPOINT option \"%s\"", opt->defname),
+					 errmsg("unrecognized %s option \"%s\"",
+							"CHECKPOINT", opt->defname),
 					 parser_errposition(pstate, opt->location)));
 	}
 
@@ -1316,7 +1318,7 @@ CompactCheckpointerRequestQueue(void)
 	num_requests = CheckpointerShmem->num_requests;
 
 	/* Initialize skip_slot array */
-	skip_slot = palloc0(sizeof(bool) * max_requests);
+	skip_slot = palloc0_array(bool, max_requests);
 
 	head = CheckpointerShmem->head;
 

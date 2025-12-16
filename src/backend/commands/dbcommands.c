@@ -431,7 +431,7 @@ ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
 			 classForm->oid);
 
 	/* Prepare a rel info element and add it to the list. */
-	relinfo = (CreateDBRelInfo *) palloc(sizeof(CreateDBRelInfo));
+	relinfo = palloc_object(CreateDBRelInfo);
 	if (OidIsValid(classForm->reltablespace))
 		relinfo->rlocator.spcOid = classForm->reltablespace;
 	else
@@ -2354,7 +2354,8 @@ DropDatabase(ParseState *pstate, DropdbStmt *stmt)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("unrecognized DROP DATABASE option \"%s\"", opt->defname),
+					 errmsg("unrecognized %s option \"%s\"",
+							"DROP DATABASE", opt->defname),
 					 parser_errposition(pstate, opt->location)));
 	}
 
@@ -3375,6 +3376,7 @@ dbase_redo(XLogReaderState *record)
 		parent_path = pstrdup(dbpath);
 		get_parent_directory(parent_path);
 		recovery_create_dbdir(parent_path, true);
+		pfree(parent_path);
 
 		/* Create the database directory with the version file. */
 		CreateDirAndVersionFile(dbpath, xlrec->db_id, xlrec->tablespace_id,

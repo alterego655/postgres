@@ -1,14 +1,16 @@
-use strict;
-use warnings;
-use PostgreSQL::Test::Cluster;
-use Test::More;
-
+# Copyright (c) 2025, PostgreSQL Global Development Group
+#
 # Test that vacuum prunes away all dead tuples killed before OldestXmin
 #
 # This test creates a table on a primary, updates the table to generate dead
 # tuples for vacuum, and then, during the vacuum, uses the replica to force
 # GlobalVisState->maybe_needed on the primary to move backwards and precede
 # the value of OldestXmin set at the beginning of vacuuming the table.
+
+use strict;
+use warnings;
+use PostgreSQL::Test::Cluster;
+use Test::More;
 
 # Set up nodes
 my $node_primary = PostgreSQL::Test::Cluster->new('primary');
@@ -192,7 +194,7 @@ $node_primary->poll_query_until(
 	qq[
 	SELECT count(*) >= 1 FROM pg_stat_activity
 		WHERE pid = $vacuum_pid
-		AND wait_event = 'BufferPin';
+		AND wait_event = 'BufferCleanup';
 	],
 	't');
 

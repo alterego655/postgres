@@ -928,7 +928,7 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 		start = pgstat_prepare_io_time(track_wal_io_timing);
 
 		pgstat_report_wait_start(WAIT_EVENT_WAL_WRITE);
-		byteswritten = pg_pwrite(recvFile, buf, segbytes, (off_t) startoff);
+		byteswritten = pg_pwrite(recvFile, buf, segbytes, (pgoff_t) startoff);
 		pgstat_report_wait_end();
 
 		pgstat_count_io_op_time(IOOBJECT_WAL, IOCONTEXT_NORMAL,
@@ -949,8 +949,8 @@ XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr, TimeLineID tli)
 			ereport(PANIC,
 					(errcode_for_file_access(),
 					 errmsg("could not write to WAL segment %s "
-							"at offset %d, length %lu: %m",
-							xlogfname, startoff, (unsigned long) segbytes)));
+							"at offset %d, length %d: %m",
+							xlogfname, startoff, segbytes)));
 		}
 
 		/* Update state for write */
@@ -1450,8 +1450,8 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
-	values = palloc0(sizeof(Datum) * tupdesc->natts);
-	nulls = palloc0(sizeof(bool) * tupdesc->natts);
+	values = palloc0_array(Datum, tupdesc->natts);
+	nulls = palloc0_array(bool, tupdesc->natts);
 
 	/* Fetch values */
 	values[0] = Int32GetDatum(pid);
@@ -1469,16 +1469,16 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
 	{
 		values[1] = CStringGetTextDatum(WalRcvGetStateString(state));
 
-		if (XLogRecPtrIsInvalid(receive_start_lsn))
+		if (!XLogRecPtrIsValid(receive_start_lsn))
 			nulls[2] = true;
 		else
 			values[2] = LSNGetDatum(receive_start_lsn);
 		values[3] = Int32GetDatum(receive_start_tli);
-		if (XLogRecPtrIsInvalid(written_lsn))
+		if (!XLogRecPtrIsValid(written_lsn))
 			nulls[4] = true;
 		else
 			values[4] = LSNGetDatum(written_lsn);
-		if (XLogRecPtrIsInvalid(flushed_lsn))
+		if (!XLogRecPtrIsValid(flushed_lsn))
 			nulls[5] = true;
 		else
 			values[5] = LSNGetDatum(flushed_lsn);
@@ -1491,7 +1491,7 @@ pg_stat_get_wal_receiver(PG_FUNCTION_ARGS)
 			nulls[8] = true;
 		else
 			values[8] = TimestampTzGetDatum(last_receipt_time);
-		if (XLogRecPtrIsInvalid(latest_end_lsn))
+		if (!XLogRecPtrIsValid(latest_end_lsn))
 			nulls[9] = true;
 		else
 			values[9] = LSNGetDatum(latest_end_lsn);

@@ -730,7 +730,7 @@ apw_dump_now(bool is_bgworker, bool dump_unlogged)
 			++num_blocks;
 		}
 
-		UnlockBufHdr(bufHdr, buf_state);
+		UnlockBufHdr(bufHdr);
 	}
 
 	snprintf(transient_dump_file_path, MAXPGPATH, "%s.tmp", AUTOPREWARM_FILE);
@@ -858,7 +858,7 @@ autoprewarm_dump_now(PG_FUNCTION_ARGS)
 }
 
 static void
-apw_init_state(void *ptr)
+apw_init_state(void *ptr, void *arg)
 {
 	AutoPrewarmSharedState *state = (AutoPrewarmSharedState *) ptr;
 
@@ -880,7 +880,7 @@ apw_init_shmem(void)
 	apw_state = GetNamedDSMSegment("autoprewarm",
 								   sizeof(AutoPrewarmSharedState),
 								   apw_init_state,
-								   &found);
+								   &found, NULL);
 
 	return found;
 }

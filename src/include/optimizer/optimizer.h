@@ -24,6 +24,8 @@
 
 #include "nodes/parsenodes.h"
 
+typedef struct ExplainState ExplainState;	/* defined in explain_state.h */
+
 /*
  * We don't want to include nodes/pathnodes.h here, because non-planner
  * code should generally treat PlannerInfo as an opaque typedef.
@@ -80,7 +82,6 @@ extern PGDLLIMPORT int effective_cache_size;
 
 extern double clamp_row_est(double nrows);
 extern int32 clamp_width_est(int64 tuple_width);
-extern long clamp_cardinality_to_long(Cardinality x);
 
 /* in path/indxpath.c: */
 
@@ -104,7 +105,8 @@ extern PGDLLIMPORT bool enable_distinct_reordering;
 
 extern PlannedStmt *planner(Query *parse, const char *query_string,
 							int cursorOptions,
-							ParamListInfo boundParams);
+							ParamListInfo boundParams,
+							ExplainState *es);
 
 extern Expr *expression_planner(Expr *expr);
 extern Expr *expression_planner_with_deps(Expr *expr,
@@ -144,6 +146,9 @@ extern Expr *evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 						   Oid result_collation);
 
 extern bool var_is_nonnullable(PlannerInfo *root, Var *var, bool use_rel_info);
+
+extern bool expr_is_nonnullable(PlannerInfo *root, Expr *expr,
+								bool use_rel_info);
 
 extern List *expand_function_arguments(List *args, bool include_out_arguments,
 									   Oid result_type,

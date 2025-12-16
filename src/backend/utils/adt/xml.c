@@ -891,8 +891,8 @@ xmltotext_with_options(xmltype *data, XmlOptionType xmloption_arg, bool indent)
 
 xmltype *
 xmlelement(XmlExpr *xexpr,
-		   Datum *named_argvalue, bool *named_argnull,
-		   Datum *argvalue, bool *argnull)
+		   const Datum *named_argvalue, const bool *named_argnull,
+		   const Datum *argvalue, const bool *argnull)
 {
 #ifdef USE_LIBXML
 	xmltype    *result;
@@ -1255,7 +1255,7 @@ pg_xml_init(PgXmlStrictness strictness)
 	pg_xml_init_library();
 
 	/* Create error handling context structure */
-	errcxt = (PgXmlErrorContext *) palloc(sizeof(PgXmlErrorContext));
+	errcxt = palloc_object(PgXmlErrorContext);
 	errcxt->magic = ERRCXT_MAGIC;
 	errcxt->strictness = strictness;
 	errcxt->err_occurred = false;
@@ -2133,7 +2133,7 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 						   node->type == XML_ELEMENT_NODE) ? node->name : NULL;
 	int			domain = error->domain;
 	int			level = error->level;
-	StringInfo	errorBuf;
+	StringInfoData errorBuf;
 
 	/*
 	 * Defend against someone passing us a bogus context struct.
@@ -2210,16 +2210,16 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	}
 
 	/* Prepare error message in errorBuf */
-	errorBuf = makeStringInfo();
+	initStringInfo(&errorBuf);
 
 	if (error->line > 0)
-		appendStringInfo(errorBuf, "line %d: ", error->line);
+		appendStringInfo(&errorBuf, "line %d: ", error->line);
 	if (name != NULL)
-		appendStringInfo(errorBuf, "element %s: ", name);
+		appendStringInfo(&errorBuf, "element %s: ", name);
 	if (error->message != NULL)
-		appendStringInfoString(errorBuf, error->message);
+		appendStringInfoString(&errorBuf, error->message);
 	else
-		appendStringInfoString(errorBuf, "(no message provided)");
+		appendStringInfoString(&errorBuf, "(no message provided)");
 
 	/*
 	 * Append context information to errorBuf.
@@ -2237,11 +2237,11 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 		xmlGenericErrorFunc errFuncSaved = xmlGenericError;
 		void	   *errCtxSaved = xmlGenericErrorContext;
 
-		xmlSetGenericErrorFunc(errorBuf,
+		xmlSetGenericErrorFunc(&errorBuf,
 							   (xmlGenericErrorFunc) appendStringInfo);
 
 		/* Add context information to errorBuf */
-		appendStringInfoLineSeparator(errorBuf);
+		appendStringInfoLineSeparator(&errorBuf);
 
 		xmlParserPrintFileContext(input);
 
@@ -2250,7 +2250,7 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	}
 
 	/* Get rid of any trailing newlines in errorBuf */
-	chopStringInfoNewlines(errorBuf);
+	chopStringInfoNewlines(&errorBuf);
 
 	/*
 	 * Legacy error handling mode.  err_occurred is never set, we just add the
@@ -2263,10 +2263,10 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	if (xmlerrcxt->strictness == PG_XML_STRICTNESS_LEGACY)
 	{
 		appendStringInfoLineSeparator(&xmlerrcxt->err_buf);
-		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf->data,
-							   errorBuf->len);
+		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf.data,
+							   errorBuf.len);
 
-		destroyStringInfo(errorBuf);
+		pfree(errorBuf.data);
 		return;
 	}
 
@@ -2281,23 +2281,23 @@ xml_errorHandler(void *data, PgXmlErrorPtr error)
 	if (level >= XML_ERR_ERROR)
 	{
 		appendStringInfoLineSeparator(&xmlerrcxt->err_buf);
-		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf->data,
-							   errorBuf->len);
+		appendBinaryStringInfo(&xmlerrcxt->err_buf, errorBuf.data,
+							   errorBuf.len);
 
 		xmlerrcxt->err_occurred = true;
 	}
 	else if (level >= XML_ERR_WARNING)
 	{
 		ereport(WARNING,
-				(errmsg_internal("%s", errorBuf->data)));
+				(errmsg_internal("%s", errorBuf.data)));
 	}
 	else
 	{
 		ereport(NOTICE,
-				(errmsg_internal("%s", errorBuf->data)));
+				(errmsg_internal("%s", errorBuf.data)));
 	}
 
-	destroyStringInfo(errorBuf);
+	pfree(errorBuf.data);
 }
 
 
@@ -4733,10 +4733,10 @@ XmlTableInitOpaque(TableFuncScanState *state, int natts)
 	XmlTableBuilderData *xtCxt;
 	PgXmlErrorContext *xmlerrcxt;
 
-	xtCxt = palloc0(sizeof(XmlTableBuilderData));
+	xtCxt = palloc0_object(XmlTableBuilderData);
 	xtCxt->magic = XMLTABLE_CONTEXT_MAGIC;
 	xtCxt->natts = natts;
-	xtCxt->xpathscomp = palloc0(sizeof(xmlXPathCompExprPtr) * natts);
+	xtCxt->xpathscomp = palloc0_array(xmlXPathCompExprPtr, natts);
 
 	xmlerrcxt = pg_xml_init(PG_XML_STRICTNESS_ALL);
 

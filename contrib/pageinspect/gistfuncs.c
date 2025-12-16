@@ -11,6 +11,7 @@
 
 #include "access/gist.h"
 #include "access/htup.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "catalog/pg_am_d.h"
 #include "funcapi.h"
@@ -360,7 +361,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 
-	relation_close(indexRel, AccessShareLock);
+	index_close(indexRel, AccessShareLock);
 
 	return (Datum) 0;
 }

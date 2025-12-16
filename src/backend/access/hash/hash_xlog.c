@@ -137,8 +137,7 @@ hash_xlog_insert(XLogReaderState *record)
 
 		page = BufferGetPage(buffer);
 
-		if (PageAddItem(page, (Item) datapos, datalen, xlrec->offnum,
-						false, false) == InvalidOffsetNumber)
+		if (PageAddItem(page, datapos, datalen, xlrec->offnum, false, false) == InvalidOffsetNumber)
 			elog(PANIC, "hash_xlog_insert: failed to add item");
 
 		PageSetLSN(page, lsn);
@@ -315,8 +314,6 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	Buffer		oldbuf;
 	Buffer		newbuf;
 	Buffer		metabuf;
-	Size		datalen PG_USED_FOR_ASSERTS_ONLY;
-	char	   *data;
 	XLogRedoAction action;
 
 	/*
@@ -376,6 +373,10 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	{
 		Page		page;
 		HashMetaPage metap;
+		Size		datalen;
+		char	   *data;
+		uint32	   *uidata;
+		int			uidatacount;
 
 		page = BufferGetPage(metabuf);
 		metap = HashPageGetMeta(page);
@@ -383,34 +384,31 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 
 		data = XLogRecGetBlockData(record, 2, &datalen);
 
+		/*
+		 * This cast is ok because XLogRecGetBlockData() returns a MAXALIGNed
+		 * buffer.
+		 */
+		uidata = (uint32 *) data;
+		uidatacount = 0;
+
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_MASKS)
 		{
-			uint32		lowmask;
-			uint32	   *highmask;
-
-			/* extract low and high masks. */
-			memcpy(&lowmask, data, sizeof(uint32));
-			highmask = (uint32 *) ((char *) data + sizeof(uint32));
+			uint32		lowmask = uidata[uidatacount++];
+			uint32		highmask = uidata[uidatacount++];
 
 			/* update metapage */
 			metap->hashm_lowmask = lowmask;
-			metap->hashm_highmask = *highmask;
-
-			data += sizeof(uint32) * 2;
+			metap->hashm_highmask = highmask;
 		}
 
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_SPLITPOINT)
 		{
-			uint32		ovflpoint;
-			uint32	   *ovflpages;
-
-			/* extract information of overflow pages. */
-			memcpy(&ovflpoint, data, sizeof(uint32));
-			ovflpages = (uint32 *) ((char *) data + sizeof(uint32));
+			uint32		ovflpoint = uidata[uidatacount++];
+			uint32		ovflpages = uidata[uidatacount++];
 
 			/* update metapage */
-			metap->hashm_spares[ovflpoint] = *ovflpages;
 			metap->hashm_ovflpoint = ovflpoint;
+			metap->hashm_spares[ovflpoint] = ovflpages;
 		}
 
 		MarkBufferDirty(metabuf);
@@ -557,10 +555,9 @@ hash_xlog_move_page_contents(XLogReaderState *record)
 
 				data += itemsz;
 
-				l = PageAddItem(writepage, (Item) itup, itemsz, towrite[ninserted], false, false);
+				l = PageAddItem(writepage, itup, itemsz, towrite[ninserted], false, false);
 				if (l == InvalidOffsetNumber)
-					elog(ERROR, "hash_xlog_move_page_contents: failed to add item to hash index page, size %d bytes",
-						 (int) itemsz);
+					elog(ERROR, "hash_xlog_move_page_contents: failed to add item to hash index page, size %zu bytes", itemsz);
 
 				ninserted++;
 			}
@@ -592,7 +589,7 @@ hash_xlog_move_page_contents(XLogReaderState *record)
 			OffsetNumber *unend;
 
 			unused = (OffsetNumber *) ptr;
-			unend = (OffsetNumber *) ((char *) ptr + len);
+			unend = (OffsetNumber *) (ptr + len);
 
 			if ((unend - unused) > 0)
 				PageIndexMultiDelete(page, unused, unend - unused);
@@ -689,10 +686,9 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 
 				data += itemsz;
 
-				l = PageAddItem(writepage, (Item) itup, itemsz, towrite[ninserted], false, false);
+				l = PageAddItem(writepage, itup, itemsz, towrite[ninserted], false, false);
 				if (l == InvalidOffsetNumber)
-					elog(ERROR, "hash_xlog_squeeze_page: failed to add item to hash index page, size %d bytes",
-						 (int) itemsz);
+					elog(ERROR, "hash_xlog_squeeze_page: failed to add item to hash index page, size %zu bytes", itemsz);
 
 				ninserted++;
 			}
@@ -903,7 +899,7 @@ hash_xlog_delete(XLogReaderState *record)
 			OffsetNumber *unend;
 
 			unused = (OffsetNumber *) ptr;
-			unend = (OffsetNumber *) ((char *) ptr + len);
+			unend = (OffsetNumber *) (ptr + len);
 
 			if ((unend - unused) > 0)
 				PageIndexMultiDelete(page, unused, unend - unused);
