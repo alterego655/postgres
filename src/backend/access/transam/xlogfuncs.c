@@ -765,7 +765,7 @@ pg_promote(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_recovery(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_RECOVERY_COLS 9
+#define PG_STAT_GET_RECOVERY_COLS 10
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	Datum		values[PG_STAT_GET_RECOVERY_COLS];
 	bool		nulls[PG_STAT_GET_RECOVERY_COLS];
@@ -781,6 +781,7 @@ pg_stat_get_recovery(PG_FUNCTION_ARGS)
 	TimestampTz recovery_last_xact_time;
 	TimestampTz current_chunk_start_time;
 	RecoveryPauseState pause_state;
+	XLogSource	wal_source;
 
 	InitMaterializedSRF(fcinfo, 0);
 
@@ -805,6 +806,7 @@ pg_stat_get_recovery(PG_FUNCTION_ARGS)
 	recovery_last_xact_time = XLogRecoveryCtl->recoveryLastXTime;
 	current_chunk_start_time = XLogRecoveryCtl->currentChunkStartTime;
 	pause_state = XLogRecoveryCtl->recoveryPauseState;
+	wal_source = XLogRecoveryCtl->lastReadSource;
 	SpinLockRelease(&XLogRecoveryCtl->info_lck);
 
 	/* Initialize nulls array */
@@ -884,6 +886,23 @@ pg_stat_get_recovery(PG_FUNCTION_ARGS)
 			break;
 		case RECOVERY_PAUSED:
 			values[8] = CStringGetTextDatum("paused");
+			break;
+	}
+
+	/* wal_source - always visible */
+	switch (wal_source)
+	{
+		case XLOG_FROM_ANY:
+			nulls[9] = true;	/* not yet determined */
+			break;
+		case XLOG_FROM_ARCHIVE:
+			values[9] = CStringGetTextDatum("archive");
+			break;
+		case XLOG_FROM_PG_WAL:
+			values[9] = CStringGetTextDatum("pg_wal");
+			break;
+		case XLOG_FROM_STREAM:
+			values[9] = CStringGetTextDatum("stream");
 			break;
 	}
 

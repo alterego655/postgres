@@ -2135,8 +2135,9 @@ pg_stat_recovery| SELECT promote_triggered,
     replay_end_tli,
     recovery_last_xact_time,
     current_chunk_start_time,
-    pause_state
-   FROM pg_stat_get_recovery() s(promote_triggered, last_replayed_read_lsn, last_replayed_end_lsn, last_replayed_tli, replay_end_lsn, replay_end_tli, recovery_last_xact_time, current_chunk_start_time, pause_state);
+    pause_state,
+    wal_source
+   FROM pg_stat_get_recovery() s(promote_triggered, last_replayed_read_lsn, last_replayed_end_lsn, last_replayed_tli, replay_end_lsn, replay_end_tli, recovery_last_xact_time, current_chunk_start_time, pause_state, wal_source);
 pg_stat_recovery_prefetch| SELECT stats_reset,
     prefetch,
     hit,

@@ -2062,6 +2062,42 @@ description | Waiting for a newly initialized WAL file to reach durable storage
       </entry>
      </row>
 
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_source</structfield> <type>text</type>
+      </para>
+      <para>
+       Source from which the startup process most recently read WAL data.
+       Possible values are:
+      </para>
+       <itemizedlist>
+        <listitem>
+         <para>
+          <literal>archive</literal>: WAL restored using
+          <varname>restore_command</varname>.
+         </para>
+        </listitem>
+        <listitem>
+         <para>
+          <literal>pg_wal</literal>: WAL read from local
+          <filename>pg_wal</filename> directory.
+         </para>
+        </listitem>
+        <listitem>
+         <para>
+          <literal>stream</literal>: WAL actively being streamed from the
+          upstream server.
+         </para>
+        </listitem>
+       </itemizedlist>
+      <para>
+       NULL if no WAL has been read yet.  Note that this reflects the
+       current read source, not the original delivery mechanism; streamed
+       WAL that is subsequently read from local files will show
+       <literal>pg_wal</literal>.
+      </para></entry>
+     </row>
+
     </tbody>
    </tgroup>
   </table>

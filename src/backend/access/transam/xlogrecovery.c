@@ -397,6 +397,7 @@ XLogRecoveryShmemInit(void)
 	memset(XLogRecoveryCtl, 0, sizeof(XLogRecoveryCtlData));
 
 	SpinLockInit(&XLogRecoveryCtl->info_lck);
+	XLogRecoveryCtl->lastReadSource = XLOG_FROM_ANY;
 	InitSharedLatch(&XLogRecoveryCtl->recoveryWakeupLatch);
 	ConditionVariableInit(&XLogRecoveryCtl->recoveryNotPausedCV);
 }
@@ -4245,6 +4246,11 @@ XLogFileRead(XLogSegNo segno, TimeLineID tli,
 		/* In FROM_STREAM case, caller tracks receipt time, not me */
 		if (source != XLOG_FROM_STREAM)
 			XLogReceiptTime = GetCurrentTimestamp();
+
+		/* Update shared memory for external visibility */
+		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+		XLogRecoveryCtl->lastReadSource = source;
+		SpinLockRelease(&XLogRecoveryCtl->info_lck);
 
 		return fd;
 	}
