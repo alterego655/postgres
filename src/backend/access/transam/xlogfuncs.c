@@ -22,10 +22,13 @@
 #include "access/xlog_internal.h"
 #include "access/xlogbackup.h"
 #include "access/xlogrecovery.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "storage/spin.h"
+#include "utils/acl.h"
 #include "replication/walreceiver.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
@@ -747,4 +750,144 @@ pg_promote(PG_FUNCTION_ARGS)
 						   wait_seconds,
 						   wait_seconds)));
 	PG_RETURN_BOOL(false);
+}
+
+/*
+ * pg_stat_get_recovery - returns information about WAL recovery state
+ *
+ * Returns zero rows when not in recovery, one row when in recovery.
+ *
+ * Privilege model: View is public, sensitive fields (LSNs, timelines,
+ * timestamps) are redacted (set to NULL) for users without pg_read_all_stats
+ * membership.  Basic operational state (promote_triggered, pause_state) is
+ * always visible.
+ */
+Datum
+pg_stat_get_recovery(PG_FUNCTION_ARGS)
+{
+#define PG_STAT_GET_RECOVERY_COLS 9
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Datum		values[PG_STAT_GET_RECOVERY_COLS];
+	bool		nulls[PG_STAT_GET_RECOVERY_COLS];
+	bool		has_privs;
+
+	/* Local copies of shared state */
+	bool		promote_triggered;
+	XLogRecPtr	last_replayed_read_lsn;
+	XLogRecPtr	last_replayed_end_lsn;
+	TimeLineID	last_replayed_tli;
+	XLogRecPtr	replay_end_lsn;
+	TimeLineID	replay_end_tli;
+	TimestampTz recovery_last_xact_time;
+	TimestampTz current_chunk_start_time;
+	RecoveryPauseState pause_state;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* Return zero rows when not in recovery */
+	if (!RecoveryInProgress())
+		return (Datum) 0;
+
+	/*
+	 * Check privilege level.  We still return a row for unprivileged users,
+	 * but redact sensitive fields (LSNs, timelines, timestamps).
+	 */
+	has_privs = has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS);
+
+	/* Take a lock to ensure value consistency */
+	SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+	promote_triggered = XLogRecoveryCtl->SharedPromoteIsTriggered;
+	last_replayed_read_lsn = XLogRecoveryCtl->lastReplayedReadRecPtr;
+	last_replayed_end_lsn = XLogRecoveryCtl->lastReplayedEndRecPtr;
+	last_replayed_tli = XLogRecoveryCtl->lastReplayedTLI;
+	replay_end_lsn = XLogRecoveryCtl->replayEndRecPtr;
+	replay_end_tli = XLogRecoveryCtl->replayEndTLI;
+	recovery_last_xact_time = XLogRecoveryCtl->recoveryLastXTime;
+	current_chunk_start_time = XLogRecoveryCtl->currentChunkStartTime;
+	pause_state = XLogRecoveryCtl->recoveryPauseState;
+	SpinLockRelease(&XLogRecoveryCtl->info_lck);
+
+	/* Initialize nulls array */
+	memset(nulls, 0, sizeof(nulls));
+
+	/* promote_triggered - always visible */
+	values[0] = BoolGetDatum(promote_triggered);
+
+	/*
+	 * Sensitive fields: LSNs, timelines, timestamps.  Redact for users
+	 * without pg_read_all_stats privilege.
+	 */
+	if (has_privs)
+	{
+		/* last_replayed_read_lsn */
+		if (XLogRecPtrIsValid(last_replayed_read_lsn))
+			values[1] = LSNGetDatum(last_replayed_read_lsn);
+		else
+			nulls[1] = true;
+
+		/* last_replayed_end_lsn */
+		if (XLogRecPtrIsValid(last_replayed_end_lsn))
+			values[2] = LSNGetDatum(last_replayed_end_lsn);
+		else
+			nulls[2] = true;
+
+		/* last_replayed_tli - NULL if corresponding LSN is invalid */
+		if (XLogRecPtrIsValid(last_replayed_end_lsn))
+			values[3] = Int32GetDatum(last_replayed_tli);
+		else
+			nulls[3] = true;
+
+		/* replay_end_lsn */
+		if (XLogRecPtrIsValid(replay_end_lsn))
+			values[4] = LSNGetDatum(replay_end_lsn);
+		else
+			nulls[4] = true;
+
+		/* replay_end_tli - NULL if corresponding LSN is invalid */
+		if (XLogRecPtrIsValid(replay_end_lsn))
+			values[5] = Int32GetDatum(replay_end_tli);
+		else
+			nulls[5] = true;
+
+		/* recovery_last_xact_time */
+		if (recovery_last_xact_time != 0)
+			values[6] = TimestampTzGetDatum(recovery_last_xact_time);
+		else
+			nulls[6] = true;
+
+		/* current_chunk_start_time */
+		if (current_chunk_start_time != 0)
+			values[7] = TimestampTzGetDatum(current_chunk_start_time);
+		else
+			nulls[7] = true;
+	}
+	else
+	{
+		/* Redact sensitive fields for unprivileged users */
+		nulls[1] = true;		/* last_replayed_read_lsn */
+		nulls[2] = true;		/* last_replayed_end_lsn */
+		nulls[3] = true;		/* last_replayed_tli */
+		nulls[4] = true;		/* replay_end_lsn */
+		nulls[5] = true;		/* replay_end_tli */
+		nulls[6] = true;		/* recovery_last_xact_time */
+		nulls[7] = true;		/* current_chunk_start_time */
+	}
+
+	/* pause_state - always visible */
+	switch (pause_state)
+	{
+		case RECOVERY_NOT_PAUSED:
+			values[8] = CStringGetTextDatum("not paused");
+			break;
+		case RECOVERY_PAUSE_REQUESTED:
+			values[8] = CStringGetTextDatum("pause requested");
+			break;
+		case RECOVERY_PAUSED:
+			values[8] = CStringGetTextDatum("paused");
+			break;
+	}
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+
+	return (Datum) 0;
 }
