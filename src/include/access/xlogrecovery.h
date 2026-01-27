@@ -62,6 +62,18 @@ typedef enum RecoveryPauseState
 } RecoveryPauseState;
 
 /*
+ * Codes indicating where we got a WAL file from during recovery, or where
+ * to attempt to get one.
+ */
+typedef enum XLogSource
+{
+	XLOG_FROM_ANY = 0,			/* request to read WAL from any source */
+	XLOG_FROM_ARCHIVE,			/* restored using restore_command */
+	XLOG_FROM_PG_WAL,			/* existing file in pg_wal */
+	XLOG_FROM_STREAM,			/* streamed from primary */
+} XLogSource;
+
+/*
  * Shared-memory state for WAL recovery.
  */
 typedef struct XLogRecoveryCtlData

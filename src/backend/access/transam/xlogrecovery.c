@@ -204,18 +204,6 @@ typedef struct XLogPageReadPrivate
 /* flag to tell XLogPageRead that we have started replaying */
 static bool InRedo = false;
 
-/*
- * Codes indicating where we got a WAL file from during recovery, or where
- * to attempt to get one.
- */
-typedef enum
-{
-	XLOG_FROM_ANY = 0,			/* request to read WAL from any source */
-	XLOG_FROM_ARCHIVE,			/* restored using restore_command */
-	XLOG_FROM_PG_WAL,			/* existing file in pg_wal */
-	XLOG_FROM_STREAM,			/* streamed from primary */
-} XLogSource;
-
 /* human-readable names for XLogSources, for debugging output */
 static const char *const xlogSourceNames[] = {"any", "archive", "pg_wal", "stream"};
 
